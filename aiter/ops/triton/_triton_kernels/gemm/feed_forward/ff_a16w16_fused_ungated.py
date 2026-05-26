@@ -104,7 +104,7 @@ def _ff_a16w16_fused_ungated(
                 cache_modifier=cache_modifier,
             )
 
-        acc = tl.dot(x, w1, acc=acc)
+        acc += tl.dot(x, w1, input_precision="ieee")
 
         # Advance the ptrs to the next K block.
         x_ptrs += BLOCK_SIZE_K * stride_xk
@@ -143,9 +143,7 @@ def _ff_a16w16_fused_ungated(
         partial_sum_y = tl.dot(acc, w2)
         # tl.device_print("w2:", w2)
         # tl.device_print("partial y:", partial_sum_y)
-        y_mask = (offs_ym[:, None] < M) & (
-            (offs_k[None, :] + BLOCK_SIZE_K * k_cyclic_offset) < K
-        )
+        y_mask = (offs_ym[:, None] < M) & ((offs_k[None, :] + BLOCK_SIZE_K * k) < K)
         tl.atomic_add(y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu")
         # tl.store(y_ptrs, partial_sum_y, mask=y_mask)
         k_cyclic_offset += 1

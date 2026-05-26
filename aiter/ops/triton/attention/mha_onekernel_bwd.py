@@ -55,7 +55,6 @@ def flash_attn_onekernel_backward(
     sink: Optional[torch.Tensor] = None,
     dsink: Optional[torch.Tensor] = None,
     config: Optional[Dict[str, any]] = None,
-    sliding_window: int = 0,
 ):
     """
     Flash Attention one-kernel backward pass with positional encoding support.
@@ -221,7 +220,6 @@ def flash_attn_onekernel_backward(
         do,
         delta,
         *o_strides,
-        *do_strides,
         *delta_strides,
         descale_strides[3],
         cu_seqlens_q,
@@ -303,8 +301,8 @@ def flash_attn_onekernel_backward(
             descale_k,
             descale_v,
             descale_do,
-            HEAD_DIM=BLOCK_D_MODEL_POW2,
-            ACTUAL_HEAD_DIM=v_head_dim,
+            HEAD_DIM=v_head_dim,
+            ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
             PE_HEAD_DIM=pe_head_dim,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
@@ -316,7 +314,6 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             ENABLE_SINK=sink is not None,
-            SLIDING_WINDOW=sliding_window,
             **config_onekernel,
         )
     else:
@@ -360,8 +357,8 @@ def flash_attn_onekernel_backward(
             descale_k,
             descale_v,
             descale_do,
-            HEAD_DIM=BLOCK_D_MODEL_POW2,
-            ACTUAL_HEAD_DIM=v_head_dim,
+            HEAD_DIM=v_head_dim,
+            ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
             PE_HEAD_DIM=pe_head_dim,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
@@ -373,7 +370,6 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             ENABLE_SINK=sink is not None,
-            SLIDING_WINDOW=sliding_window,
             **config_onekernel,
         )
 

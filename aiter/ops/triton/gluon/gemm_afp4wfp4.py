@@ -1,16 +1,14 @@
 from typing import Optional
 import functools
 import json
-
-import torch
 import triton
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
-
+import torch
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 _LOGGER = AiterTritonLogger()
 
@@ -146,10 +144,9 @@ def _gemm_afp4wfp4_kernel(
         vec=1, per_phase=1, max_phase=1, order=[0, 1]
     )
 
-    MFMA_INSTR_SHAPE: gl.constexpr = [32, 32, 64]
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=MFMA_INSTR_SHAPE,
+        instr_shape=[32, 32],
         transposed=True,
         warps_per_cta=[2, num_warps // 2],
     )

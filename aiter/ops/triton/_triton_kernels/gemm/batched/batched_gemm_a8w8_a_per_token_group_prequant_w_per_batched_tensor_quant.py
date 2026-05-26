@@ -16,8 +16,8 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
         "EVEN_K",
-        "EVEN_MN",
         "cache_modifier",
+        "GRID_MN",
     ],
 )
 
@@ -25,13 +25,12 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
-        and (args["N"] % args["BLOCK_SIZE_N"] == 0),
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(
-    repr=_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr,
-    do_not_specialize=["M", "N"],
+    repr=_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr
 )
 def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel(
     # Pointers to matrices
@@ -67,8 +66,8 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
-    EVEN_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
+    GRID_MN: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
@@ -140,12 +139,8 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     tl.assume(batch_id >= 0)
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    if EVEN_MN:
-        offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    else:
-        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     a_ptrs = a_ptr + (
         batch_id * stride_ab
         + offs_am[:, None] * stride_am
@@ -175,7 +170,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         a_scale_recip = 1.0 / a_scale
         a = tl.clamp(a * a_scale_recip, DTYPE_MIN, DTYPE_MAX).to(b_ptr.dtype.element_ty)
 
-        accumulator += tl.dot(a, b) * a_scale
+        accumulator += tl.dot(a, b, input_precision="ieee") * a_scale
 
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -183,10 +178,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     accumulator *= b_scale
 
     if HAS_BIAS:
-        if EVEN_MN:
-            offs_bias = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        else:
-            offs_bias = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_bias = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         bias = tl.load(bias_ptr + batch_id * stride_biasb + offs_bias)
         accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
 
@@ -200,11 +192,9 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         + stride_cm * offs_cm[:, None]
         + stride_cn * offs_cn[None, :]
     )
-    if EVEN_MN:
-        tl.store(c_ptrs, c)
-    else:
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, c, mask=c_mask)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
 def _get_config(

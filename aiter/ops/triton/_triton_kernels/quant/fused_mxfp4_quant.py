@@ -9,10 +9,8 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
     row_norm = row * row
     row_norm = tl.sum(row_norm, axis=-1)
     norm_factor = tl.math.rsqrt((row_norm / n_cols) + epsilon)
-    if weight is not None:
-        rms_norm = row * norm_factor[:, None] * weight
-    else:
-        rms_norm = row * norm_factor[:, None]
+
+    rms_norm = row * norm_factor[:, None] * weight
     return rms_norm
 
 
@@ -838,6 +836,7 @@ def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
     stride_o0,  #: tl.constexpr,
     stride_o4,  #: tl.constexpr,
     token_num,  #: tl.constexpr,
+    M_i,  #: tl.constexpr,
     N_i,  #: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_Mx: tl.constexpr,

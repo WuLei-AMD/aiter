@@ -140,26 +140,10 @@ def _gemm_afp4wfp4_kernel(
         )
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            # Load scales, masking OOB when K is not aligned to BLOCK_SIZE_K.
-            # OOB scales could contain 0xFF (NaN in e8m0) which propagates
-            # through dot_scaled even when the corresponding data is zero.
-            if EVEN_K:
-                a_scales = tl.load(a_scale_ptrs)
-                b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
-            else:
-                scale_mask = offs_scale_k[None, :] < (
-                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-                )
-                a_scales = tl.load(a_scale_ptrs, mask=scale_mask, other=127)
-                b_scales = tl.load(
-                    b_scale_ptrs,
-                    mask=scale_mask,
-                    other=127,
-                    cache_modifier=cache_modifier,
-                )
+            a_scales = tl.load(a_scale_ptrs)
+            b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
 
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
@@ -353,79 +337,15 @@ def _gemm_afp4wfp4_kernel_preshuffle_scales(
             )
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-        offs_shuffled_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE * 32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            # Load scales, masking OOB when K is not aligned to BLOCK_SIZE_K.
-            # OOB scales could contain 0xFF (NaN in e8m0) which propagates
-            # through dot_scaled even when the corresponding data is zero.
-            if EVEN_K:
-                if BLOCK_SIZE_M < 32:
-                    a_scales = tl.load(a_scale_ptrs)
-                else:
-                    a_scales = (
-                        tl.load(a_scale_ptrs)
-                        .reshape(
-                            BLOCK_SIZE_M // 32,
-                            BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
-                            4,
-                            16,
-                            2,
-                            2,
-                            1,
-                        )
-                        .permute(0, 5, 3, 1, 4, 2, 6)
-                        .reshape(BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-                    )
-                b_scales = (
-                    tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
-                    .reshape(
-                        BLOCK_SIZE_N // 32,
-                        BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
-                        4,
-                        16,
-                        2,
-                        2,
-                        1,
-                    )
-                    .permute(0, 5, 3, 1, 4, 2, 6)
-                    .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-                )
+            if BLOCK_SIZE_M < 32:
+                a_scales = tl.load(a_scale_ptrs)
             else:
-                shuffled_scale_mask = offs_shuffled_scale_k[None, :] < (
-                    2 * K - k * BLOCK_SIZE_K
-                )
-                if BLOCK_SIZE_M < 32:
-                    a_scale_mask = offs_scale_k[None, :] < (
-                        2 * K // SCALE_GROUP_SIZE
-                        - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-                    )
-                    a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=127)
-                else:
-                    a_scales = (
-                        tl.load(a_scale_ptrs, mask=shuffled_scale_mask, other=127)
-                        .reshape(
-                            BLOCK_SIZE_M // 32,
-                            BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
-                            4,
-                            16,
-                            2,
-                            2,
-                            1,
-                        )
-                        .permute(0, 5, 3, 1, 4, 2, 6)
-                        .reshape(BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-                    )
-                b_scales = (
-                    tl.load(
-                        b_scale_ptrs,
-                        mask=shuffled_scale_mask,
-                        other=127,
-                        cache_modifier=cache_modifier,
-                    )
+                a_scales = (
+                    tl.load(a_scale_ptrs)
                     .reshape(
-                        BLOCK_SIZE_N // 32,
+                        BLOCK_SIZE_M // 32,
                         BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
                         4,
                         16,
@@ -434,8 +354,22 @@ def _gemm_afp4wfp4_kernel_preshuffle_scales(
                         1,
                     )
                     .permute(0, 5, 3, 1, 4, 2, 6)
-                    .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                    .reshape(BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
+            b_scales = (
+                tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
+                .reshape(
+                    BLOCK_SIZE_N // 32,
+                    BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
+                    4,
+                    16,
+                    2,
+                    2,
+                    1,
+                )
+                .permute(0, 5, 3, 1, 4, 2, 6)
+                .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+            )
 
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
@@ -713,6 +647,65 @@ def _gemm_afp4wfp4_preshuffle_kernel(
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
+
+
+_gemm_afp4wfp4_reduce_repr = make_kernel_repr(
+    "_gemm_afp4wfp4_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
+
+
+@triton.heuristics({})  # dummy heuristics to invoke kernel re-naming
+@triton.jit(repr=_gemm_afp4wfp4_reduce_repr)
+def _gemm_afp4wfp4_reduce_kernel(
+    c_in_ptr,
+    c_out_ptr,
+    M,
+    N,
+    stride_c_in_k,
+    stride_c_in_m,
+    stride_c_in_n,
+    stride_c_out_m,
+    stride_c_out_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    ACTUAL_KSPLIT: tl.constexpr,
+    MAX_KSPLIT: tl.constexpr,
+):
+
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, MAX_KSPLIT)
+    c_in_ptrs = (
+        c_in_ptr
+        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_m[None, :, None] * stride_c_in_m)
+        + (offs_n[None, None, :] * stride_c_in_n)
+    )
+
+    if ACTUAL_KSPLIT == MAX_KSPLIT:
+        c = tl.load(c_in_ptrs)
+    else:
+        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT)
+    c = tl.sum(c, axis=0)
+
+    c = c.to(c_out_ptr.type.element_ty)
+
+    c_out_ptrs = (
+        c_out_ptr
+        + (offs_m[:, None] * stride_c_out_m)
+        + (offs_n[None, :] * stride_c_out_n)
+    )
+
+    tl.store(c_out_ptrs, c)
 
 
 def _get_config(

@@ -40,24 +40,13 @@ def _routing_compute_indx(
     EVEN_M: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
     N_EXPTS_ACT_PAD: tl.constexpr,
-    USE_TDM: tl.constexpr,
 ):
 
     tl.static_assert(N_EXPTS_ACT_PAD * BLOCK_M <= 32768)
 
-    LOAD_SIZE: tl.constexpr = N_EXPTS_ACT_PAD * BLOCK_M
-    local_offs = tl.arange(0, LOAD_SIZE)
+    local_offs = tl.arange(0, N_EXPTS_ACT_PAD * BLOCK_M)
     offs = pid_m * BLOCK_M * N_EXPTS_ACT + local_offs
-    if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
-        expt_desc = tl.make_tensor_descriptor(
-            base=ExptIndx + pid_m * BLOCK_M * N_EXPTS_ACT,
-            shape=(1, LOAD_SIZE),
-            strides=(LOAD_SIZE, 1),
-            block_shape=(1, LOAD_SIZE),
-        )
-        expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,))
-        expert = tl.where(offs < n_gates, expert, -1).to(tl.uint32)
-    elif EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
+    if EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
     else:
         expert = tl.load(ExptIndx + offs, mask=(offs < n_gates), other=-1).to(tl.uint32)
@@ -114,24 +103,13 @@ def _routing_compute_indx_fused(
     EVEN_M: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
     N_EXPTS_ACT_PAD: tl.constexpr,
-    USE_TDM: tl.constexpr,
 ):
 
     tl.static_assert(N_EXPTS_ACT_PAD * BLOCK_M <= 32768)
 
-    LOAD_SIZE: tl.constexpr = N_EXPTS_ACT_PAD * BLOCK_M
-    local_offs = tl.arange(0, LOAD_SIZE)
+    local_offs = tl.arange(0, N_EXPTS_ACT_PAD * BLOCK_M)
     offs = local_offs
-    if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
-        expt_desc = tl.make_tensor_descriptor(
-            base=ExptIndx,
-            shape=(1, LOAD_SIZE),
-            strides=(LOAD_SIZE, 1),
-            block_shape=(1, LOAD_SIZE),
-        )
-        expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,))
-        expert = tl.where(offs < n_gates, expert, -1).to(tl.uint32)
-    elif EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
+    if EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
     else:
         expert = tl.load(ExptIndx + offs, mask=(offs < n_gates), other=-1).to(tl.uint32)
@@ -198,7 +176,6 @@ def _combined_routing(
     tile_dim_log2: tl.constexpr,
     BLOCK_A: tl.constexpr,
     EQUAL_A: tl.constexpr,
-    USE_TDM: tl.constexpr,
 ):
 
     pid = tl.program_id(0)
@@ -237,7 +214,6 @@ def _combined_routing(
             EVEN_M,
             N_EXPTS_ACT,
             N_EXPTS_ACT_PAD,
-            USE_TDM,
         )
 
 
@@ -268,7 +244,6 @@ def _combined_routing_fused(
     tile_dim_log2: tl.constexpr,
     BLOCK_A: tl.constexpr,
     EQUAL_A: tl.constexpr,
-    USE_TDM: tl.constexpr,
 ):
 
     pid = tl.program_id(0)
@@ -283,8 +258,6 @@ def _combined_routing_fused(
         BLOCK_M,
         EVEN_M,
     )
-
-    tl.debug_barrier()
 
     if pid != 0 and pid < blocks1a:
         n_tokens = tl.load(ExpertHist + pid)
@@ -320,5 +293,4 @@ def _combined_routing_fused(
             EVEN_M,
             N_EXPTS_ACT,
             N_EXPTS_ACT_PAD,
-            USE_TDM,
         )

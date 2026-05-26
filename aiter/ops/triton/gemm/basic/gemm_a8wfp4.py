@@ -7,10 +7,8 @@ import triton
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8wfp4 import (
     _gemm_a8wfp4_kernel,
+    _gemm_afp4_wfp4_reduce_kernel,
     _get_config,
-)
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -79,11 +77,6 @@ def gemm_a8wfp4(
         config, _ = _get_config(M, N, K)
 
     if M <= 128:
-        # Disable split-K when M < BLOCK_SIZE_M to work around incorrect
-        # partial sums produced by the split-K kernel on gfx950 for small M.
-        if M < config["BLOCK_SIZE_M"]:
-            config["NUM_KSPLIT"] = 1
-            config["SPLITK_BLOCK_SIZE"] = 2 * K
         if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty(
                 (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device
@@ -93,11 +86,7 @@ def gemm_a8wfp4(
                 (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
             )
     else:
-        assert config.get("NUM_KSPLIT", 1) == 1, (
-            f"gemm_a8wfp4: split-K (NUM_KSPLIT={config.get('NUM_KSPLIT')}) is not supported "
-            f"for M > 128 (M={M}). Set NUM_KSPLIT=1 in the config."
-        )
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
+        SPLITK_BLOCK_SIZE = 2 * K
         y_pp = None
 
     grid = lambda META: (  # noqa: E731
@@ -153,10 +142,9 @@ def gemm_a8wfp4(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _gemm_afp4_wfp4_reduce_kernel[grid_reduce](
             y_pp,
             y,
-            None,
             M,
             N,
             y_pp.stride(0),
@@ -168,8 +156,4 @@ def gemm_a8wfp4(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             config["NUM_KSPLIT"],
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_afp4_wfp4_reduce_kernel",
         )

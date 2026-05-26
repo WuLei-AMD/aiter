@@ -3,11 +3,7 @@
 
 import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import (
-    get_gemm_config,
-    compute_splitk_params,
-)
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 import triton
 
@@ -19,21 +15,16 @@ _gemm_a8w8_repr = make_kernel_repr(
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
-        "NUM_KSPLIT",
-        "SPLITK_BLOCK_SIZE",
         "EVEN_K",
         "GRID_MN",
-        "cache_modifier",
-        "HAS_BIAS",
+        "NUM_XCDS",
     ],
 )
 
 
 @triton.heuristics(
     {
-        "EVEN_K": lambda args: (args["K"] % args["BLOCK_SIZE_K"] == 0)
-        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
-        and (args["K"] % args["SPLITK_BLOCK_SIZE"] == 0),
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
@@ -59,7 +50,6 @@ def _gemm_a8w8_kernel(
     stride_ak,
     stride_bk,
     stride_bn,
-    stride_ck,
     stride_cm,
     stride_cn,
     # Meta-parameters
@@ -68,24 +58,23 @@ def _gemm_a8w8_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    NUM_KSPLIT: tl.constexpr,
-    SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
-    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 instead.
+    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 function
+    below
 
     Computes the 8 bit matmul C = A x B, applies a conversion scale and optionally adds a bias to
     the result.
-    The conversion scale is received in the form of two 1D tensors that are multiplied and form a
+    The conversion scale is received in the form of two 1D tensors that are multiplied to form a
     2D one before being applied.
 
     Key parameters:
     - A: Matrix A with shape (M, K).
     - B: Matrix B with shape (K, N).
-    - C: Matrix C with shape (M, N) if NUM_KSPLIT==1, (NUM_KSPLIT, M, N) otherwise.
+    - C: Matrix C with shape (M, N).
     - A_scale: First scale tensor with shape (M, 1).
     - B_scale: Second scale tensor with shape (1, N).
     - Bias: Bias tensor with shape (1, N).
@@ -101,93 +90,98 @@ def _gemm_a8w8_kernel(
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
-    pid_unified = tl.program_id(axis=0)
-    # remap so that XCDs get continous chunks of pids (of CHUNK_SIZE).
-    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
-
-    pid_k = pid_unified % NUM_KSPLIT
-    pid = pid_unified // NUM_KSPLIT
+    pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    if NUM_KSPLIT == 1:
-        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    ## pid remapping on xcds
+    # Number of pids per XCD in the new arrangement
+    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+    # When GRID_MN cannot divide NUM_XCDS, some xcds will have
+    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
+    # We calculate the number of xcds that have pids_per_xcd pids as
+    # tall_xcds
+    tall_xcds = GRID_MN % NUM_XCDS
+    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+    # Compute current XCD and local pid within the XCD
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    # Calculate new pid based on the new grouping
+    # Note that we need to consider the following two cases:
+    # 1. the current pid is on a tall xcd
+    # 2. the current pid is on a short xcd
+    if xcd < tall_xcds:
+        pid = xcd * pids_per_xcd + local_pid
     else:
+        pid = (
+            tall_xcds * pids_per_xcd
+            + (xcd - tall_xcds) * (pids_per_xcd - 1)
+            + local_pid
+        )
+
+    if GROUP_SIZE_M == 1:
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
 
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
-    tl.assume(pid_k >= 0)
 
-    split_k_start = pid_k * SPLITK_BLOCK_SIZE
-    if split_k_start < K:
+    # Create pointers for first block of A and B input matrices
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-        # Create pointers for first block of A and B input matrices
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_k_split = split_k_start + offs_k
-        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        a_ptrs = a_ptr + (
-            offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
-        )
-        b_ptrs = b_ptr + (
-            offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-        )
+    # Create pointers for the scale tensors and load them
+    offs_a_scale = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M) % M
+    offs_b_scale = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) % N
+    a_scale = tl.load(a_scale_ptr + offs_a_scale)
+    b_scale = tl.load(b_scale_ptr + offs_b_scale)
 
-        # Create pointers for the scale tensors and load them
-        a_scale = tl.load(a_scale_ptr + offs_am)
-        b_scale = tl.load(b_scale_ptr + offs_bn)
+    acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load the next block of A and B, generate a mask by checking the K dimension.
+        # If it is out of bounds, set it to 0.
+        if EVEN_K:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
-        k_span = split_k_end - split_k_start
-        num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
+        accumulator += tl.dot(a, b, input_precision="ieee")
 
-        for k in range(num_k_iter):
-            if EVEN_K:
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
-            else:
-                a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
-                )
-                b = tl.load(
-                    b_ptrs,
-                    mask=offs_k[:, None] < k_span - k * BLOCK_SIZE_K,
-                    other=0.0,
-                    cache_modifier=cache_modifier,
-                )
+        # Advance the ptrs to the next K block.
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
 
-            accumulator += tl.dot(a, b)
+    # Apply scale
+    accumulator *= a_scale[:, None] * b_scale[None, :]
 
-            # Advance the ptrs to the next K block.
-            a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+    # Add bias
+    if HAS_BIAS:
+        offs_bias = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) % N
+        bias = tl.load(bias_ptr + offs_bias)
+        accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
 
-        # Apply scale
-        accumulator *= a_scale[:, None] * b_scale[None, :]
+    c = accumulator.to(c_ptr.type.element_ty)
 
-        # Add bias (only when not splitting K; bias is added after reduce)
-        if HAS_BIAS:
-            bias = tl.load(bias_ptr + offs_bn)
-            accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
-
-        c = accumulator.to(c_ptr.type.element_ty)
-
-        # Write back the block of the output matrix C with masks.
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        c_ptrs = (
-            c_ptr
-            + stride_cm * offs_cm[:, None]
-            + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
-        )
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, c, mask=c_mask)
+    # Write back the block of the output matrix C with masks.
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
 def _get_config(
@@ -195,5 +189,5 @@ def _get_config(
     N: int,
     K: int,
 ):
-    config, is_tunned = get_gemm_config("GEMM-A8W8", M, N, K)
-    return compute_splitk_params(config, K), is_tunned
+
+    return get_gemm_config("GEMM-A8W8", M, N, K)

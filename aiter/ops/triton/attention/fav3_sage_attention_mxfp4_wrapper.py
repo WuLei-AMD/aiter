@@ -2,18 +2,15 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple
+from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
     sage_fwd_mxfp4,
+    sage_quant_mxfp4,
 )
-from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
-
-
-import aiter
 
 
 def get_sage_fwd_configs_mxfp4():
@@ -50,7 +47,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         config: Optional[dict] = None,
         R: torch.Tensor = None,
         BLOCK_R: int = 128,
-        block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ):
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
@@ -60,10 +56,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         if config is None:
             config = get_sage_fwd_configs_mxfp4()
 
-        FP8_TYPE = aiter.dtypes.fp8
-        FP8_MAX = torch.finfo(FP8_TYPE).max
-
-        assert hadamard_rotation, "hadamard_rotation=False not supported at the moment"
         (
             q_quantized,
             q_descale,
@@ -76,27 +68,13 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             q,
             k,
             v,
-            FP8_TYPE,
-            FP8_MAX,
-            BLKQ=config["BLOCK_M"],
-            BLKK=64,
-            layout=layout,
+            hadamard_rotation=hadamard_rotation,
             R=R,
-            BLOCK_R=BLOCK_R,
+            BLOCK_M=config["BLOCK_M"],
+            BLOCK_R=BLOCK_R if R is None else R.shape[-1],
             q_smoothing=q_smooth,
+            layout=layout,
         )
-        # TODO: fused quant has perf downgrade
-        # fused_sage_quant_mxfp4(
-        #     q,
-        #     k,
-        #     v,
-        #     hadamard_rotation=hadamard_rotation,
-        #     R=R,
-        #     BLOCK_M=config["BLOCK_M"],
-        #     BLOCK_R=BLOCK_R if R is None else R.shape[-1],
-        #     q_smoothing=q_smooth,
-        #     layout=layout,
-        # )
 
         qd_mapped = map_dims(q_descale.shape, bhsd_map)
         kd_mapped = map_dims(k_descale.shape, bhsd_map)
@@ -106,19 +84,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
 
         assert tuple(qd_mapped) == expected_q_ds, "q_descale mismatch"
         assert tuple(kd_mapped) == expected_k_ds, "k_descale mismatch"
-
-        if block_lut is not None:
-            kv_block_indices, lut_start, lut_count = block_lut
-            use_block_sparse = True
-            if causal:
-                raise NotImplementedError(
-                    "The Triton block-sparse attention path selected by block_lut "
-                    "does not support causal masking."
-                    "require causal=False."
-                )
-        else:
-            kv_block_indices = lut_start = lut_count = None
-            use_block_sparse = False
 
         out = fav3_sage_mxfp4_func(
             q=q_quantized,
@@ -131,10 +96,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             causal=causal,
             layout=layout,
             config=config,
-            kv_block_indices=kv_block_indices,
-            lut_start=lut_start,
-            lut_count=lut_count,
-            use_block_sparse=use_block_sparse,
         )
 
         return out
@@ -157,7 +118,6 @@ def fav3_sage_mxfp4_wrapper(
     config: Optional[dict] = None,
     R: torch.Tensor = None,
     BLOCK_R: int = 128,
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """High-precision entry point for MXFP4 SageAttention."""
     for tensor, name in zip([q, k, v], ["q", "k", "v"]):
@@ -168,17 +128,7 @@ def fav3_sage_mxfp4_wrapper(
         ], f"Expected high-precision for {name}, got {tensor.dtype}"
 
     return _FAv3SageMXFP4WrapperFunc.apply(
-        q,
-        k,
-        v,
-        causal,
-        layout,
-        q_smooth,
-        hadamard_rotation,
-        config,
-        R,
-        BLOCK_R,
-        block_lut,
+        q, k, v, causal, layout, q_smooth, hadamard_rotation, config, R, BLOCK_R
     )
 
 
@@ -193,10 +143,6 @@ def fav3_sage_mxfp4_func(
     causal: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
-    kv_block_indices: Optional[torch.Tensor] = None,
-    lut_start: Optional[torch.Tensor] = None,
-    lut_count: Optional[torch.Tensor] = None,
-    use_block_sparse: bool = False,
 ):
     """Direct MXFP4 kernel execution with unused parameters removed."""
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -231,7 +177,7 @@ def fav3_sage_mxfp4_func(
     # delta s is the bias
     if bias is not None:
         USE_BIAS = True
-        stride_bz, stride_bh, stride_bm, stride_bn = bias.stride()
+        stride_bz, stride_bm, stride_bh, stride_bn = map_dims(bias.stride(), bshd_map)
     else:
         USE_BIAS = False
         stride_bz, stride_bm, stride_bh, stride_bn = 0, 0, 0, 0
@@ -244,24 +190,6 @@ def fav3_sage_mxfp4_func(
     # Kernel padding logic
     padded_d_qk = max(16, 1 << (head_size_qk - 1).bit_length())
     padded_d_v = max(16, 1 << (head_size_v - 1).bit_length())
-
-    # Block sparse logic
-    if use_block_sparse:
-        if kv_block_indices is None or lut_start is None or lut_count is None:
-            raise ValueError(
-                "kv_block_indices, lut_start, and lut_count must be provided "
-                "when use_block_sparse=True"
-            )
-        if causal:
-            raise NotImplementedError(
-                "The Triton block-sparse attention path selected by block_lut "
-                "does not support causal masking."
-                "require causal=False."
-            )
-    else:
-        kv_block_indices = torch.zeros(1, dtype=torch.int32, device=q.device)
-        lut_start = torch.zeros(1, dtype=torch.int32, device=q.device)
-        lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
 
     def grid(META):
         return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
@@ -301,9 +229,6 @@ def fav3_sage_mxfp4_func(
         stride_bn=stride_bn,  # Bias strides
         cu_seqlens_q=None,
         cu_seqlens_k=None,
-        kv_block_indices=kv_block_indices,
-        lut_start=lut_start,
-        lut_count=lut_count,
         Q_DTYPE_STR="e2m1",
         K_DTYPE_STR="e2m1",
         HQ=nheads_q,
@@ -317,7 +242,6 @@ def fav3_sage_mxfp4_func(
         BLOCK_DMODEL_QK=padded_d_qk,
         BLOCK_DMODEL_V=padded_d_v,
         USE_BIAS=USE_BIAS,
-        USE_BLOCK_SPARSE=use_block_sparse,
         **config,
     )
 

@@ -4,8 +4,6 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -32,10 +30,8 @@ except ImportError:
 
 # for some newer triton>=3.5 version, a 3D instr_shape is required.
 try:
-    _cdna_version = get_cdna_version()
-    _version = _cdna_version if _cdna_version > 0 else 3
     _: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=_version,
+        version=4,
         instr_shape=[16, 16],
         transposed=False,
         warps_per_cta=[1, 1],
@@ -77,7 +73,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 1,
-    CDNA_VERSION: gl.constexpr = 3,
 ):
     pid = tl.program_id(0)
     num_block_q_head = tl.cdiv(heads_num, ChunkQ)
@@ -127,20 +122,12 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         order=[1, 0],
     )
 
-    if _Use_2d_instr_shape_mfma_layout:
-        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=CDNA_VERSION,
-            instr_shape=[16, 16],
-            transposed=False,
-            warps_per_cta=[1, NumWarps],
-        )
-    else:
-        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=CDNA_VERSION,
-            instr_shape=[16, 16, 32],
-            transposed=False,
-            warps_per_cta=[1, NumWarps],
-        )
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16],
+        transposed=False,
+        warps_per_cta=[1, NumWarps],
+    )
     mfma_layout_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
     )
@@ -341,7 +328,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
-    CDNA_VERSION: gl.constexpr = 3,
 ):
     # ===---------------------------------------------------
     # Gluon Layout
@@ -364,7 +350,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
     if _Use_2d_instr_shape_mfma_layout:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=CDNA_VERSION,
+            version=4,
             instr_shape=[16, 16],
             transposed=False,
             warps_per_cta=[1, NumWarps],
@@ -372,7 +358,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         )
     else:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=CDNA_VERSION,
+            version=4,
             instr_shape=[16, 16, 32],
             transposed=False,
             warps_per_cta=[1, NumWarps],
@@ -735,14 +721,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                         0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
                     )
                 ),
-                mask=(
-                    context_idx
-                    + ChunkK
-                    + gl.arange(
-                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
-                    )
-                )
-                < max_model_len,
             )
 
         context_idx = split_context_start + split_context_length - ChunkK
@@ -933,11 +911,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 context_idx
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=(
-                context_idx
-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            )
-            < max_model_len,
         )
 
         for context_idx_ in range(
@@ -1013,14 +986,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                         0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
                     )
                 ),
-                mask=(
-                    context_idx_
-                    + ChunkKPerStage
-                    + gl.arange(
-                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
-                    )
-                )
-                < max_model_len,
             )
 
             # =======================================================================================
@@ -1095,14 +1060,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                         0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
                     )
                 ),
-                mask=(
-                    context_idx_
-                    + ChunkK
-                    + gl.arange(
-                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
-                    )
-                )
-                < max_model_len,
             )
             context_idx = context_idx_ + ChunkK
 
@@ -1136,12 +1093,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 + ChunkKPerStage
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=(
-                context_idx
-                + ChunkKPerStage
-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            )
-            < max_model_len,
         )
 
 
@@ -1171,7 +1122,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
-    CDNA_VERSION: gl.constexpr = 3,
 ):
     # ===---------------------------------------------------
     # Gluon Layout
@@ -1194,7 +1144,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
 
     if _Use_2d_instr_shape_mfma_layout:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=CDNA_VERSION,
+            version=4,
             instr_shape=[16, 16],
             transposed=False,
             warps_per_cta=[1, NumWarps],
@@ -1202,7 +1152,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
         )
     else:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=CDNA_VERSION,
+            version=4,
             instr_shape=[16, 16, 32],
             transposed=False,
             warps_per_cta=[1, NumWarps],
@@ -1582,14 +1532,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                         0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
                     )
                 ),
-                mask=(
-                    context_idx
-                    + ChunkK
-                    + gl.arange(
-                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
-                    )
-                )
-                < max_model_len,
             )
 
         context_idx = split_context_start + split_context_length - ChunkK
@@ -1780,11 +1722,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                 context_idx
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=(
-                context_idx
-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            )
-            < max_model_len,
         )
 
         for context_idx_ in range(
@@ -1860,14 +1797,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                         0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
                     )
                 ),
-                mask=(
-                    context_idx_
-                    + ChunkKPerStage
-                    + gl.arange(
-                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
-                    )
-                )
-                < max_model_len,
             )
 
             # =======================================================================================
@@ -1942,14 +1871,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                         0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
                     )
                 ),
-                mask=(
-                    context_idx_
-                    + ChunkK
-                    + gl.arange(
-                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
-                    )
-                )
-                < max_model_len,
             )
             context_idx = context_idx_ + ChunkK
 
@@ -1983,10 +1904,4 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                 + ChunkKPerStage
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=(
-                context_idx
-                + ChunkKPerStage
-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            )
-            < max_model_len,
         )

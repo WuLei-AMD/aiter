@@ -5,55 +5,13 @@ import triton.language as tl
 
 
 @triton.jit
+def _silu(x):
+    return x * tl.sigmoid(x)
+
+
+@triton.jit
 def _silu_exp2(x):
     return x / (1.0 + tl.exp2(-(x * 1.44269504089)))
-
-
-@triton.jit
-def _silu(x):
-    return _silu_exp2(x)
-
-
-@triton.jit
-def fused_silu_mul_kernel(
-    inp_ptr,
-    out_ptr,
-    n_rows,
-    n_cols,
-    row_stride_in,
-    col_stride_in,
-    row_stride_out,
-    col_stride_out,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """
-    SiLU on the first half of the last dimension, multiply by the second half.
-    Each row has 2 * n_cols input elements; writes n_cols outputs.
-    2D grid: axis 0 tiles rows (BLOCK_M), axis 1 tiles columns (BLOCK_N).
-    """
-    m_pid = tl.program_id(0)
-    n_pid = tl.program_id(1)
-    m_offs = tl.arange(0, BLOCK_M)
-    n_offs = tl.arange(0, BLOCK_N)
-    row_idx = m_pid * BLOCK_M + m_offs
-    col_idx = n_pid * BLOCK_N + n_offs
-
-    row_in = row_idx * row_stride_in
-    row_out = row_idx * row_stride_out
-
-    first_half_ptrs = inp_ptr + row_in[:, None] + col_idx[None, :] * col_stride_in
-    second_half_ptrs = (
-        inp_ptr + row_in[:, None] + (n_cols + col_idx)[None, :] * col_stride_in
-    )
-    out_ptrs = out_ptr + row_out[:, None] + col_idx[None, :] * col_stride_out
-
-    mask = (row_idx < n_rows)[:, None] & (col_idx < n_cols)[None, :]
-    a = tl.load(first_half_ptrs, mask=mask, other=0.0).to(tl.float32)
-    silu_a = _silu_exp2(a).to(inp_ptr.dtype.element_ty)
-    b = tl.load(second_half_ptrs, mask=mask, other=0.0)
-    o = (silu_a * b).to(out_ptr.dtype.element_ty)
-    tl.store(out_ptrs, o, mask=mask)
 
 
 @triton.jit
@@ -315,3 +273,68 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
             x_bs.to(x_bs_ptr.dtype.element_ty),
             mask=bs_mask,
         )
+
+
+# ── Fused SwiGLU forward / backward ─────────────────────────────────────
+
+@triton.jit
+def _swiglu_fwd_kernel(
+    Y_ptr, OUT_ptr,
+    stride_y_row, stride_out_row, half_cols: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused SwiGLU forward: silu(y1) * y2.
+
+    Input Y has shape (M, 2*half_cols). Splits along last dim, computes
+    silu on the first half and multiplies with the second half.
+    """
+    row = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < half_cols
+
+    y1_ptrs = Y_ptr + row * stride_y_row + col_offsets
+    y2_ptrs = Y_ptr + row * stride_y_row + half_cols + col_offsets
+    out_ptrs = OUT_ptr + row * stride_out_row + col_offsets
+
+    y1 = tl.load(y1_ptrs, mask=mask, other=0.0).to(tl.float32)
+    y2 = tl.load(y2_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    silu_y1 = y1 * tl.sigmoid(y1)
+    result = silu_y1 * y2
+
+    tl.store(out_ptrs, result, mask=mask)
+
+
+@triton.jit
+def _swiglu_bwd_kernel(
+    GRAD_ptr, Y_ptr, DOUT_ptr,
+    stride_g_row, stride_y_row, stride_d_row, half_cols: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused SwiGLU backward: d_y1 = g * dsilu(y1) * y2, d_y2 = g * silu(y1).
+
+    GRAD is (M, half_cols), Y is (M, 2*half_cols), DOUT is (M, 2*half_cols).
+    """
+    row = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < half_cols
+
+    g_ptrs = GRAD_ptr + row * stride_g_row + col_offsets
+    y1_ptrs = Y_ptr + row * stride_y_row + col_offsets
+    y2_ptrs = Y_ptr + row * stride_y_row + half_cols + col_offsets
+    d1_ptrs = DOUT_ptr + row * stride_d_row + col_offsets
+    d2_ptrs = DOUT_ptr + row * stride_d_row + half_cols + col_offsets
+
+    g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
+    y1 = tl.load(y1_ptrs, mask=mask, other=0.0).to(tl.float32)
+    y2 = tl.load(y2_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    sig_y1 = tl.sigmoid(y1)
+    silu_y1 = y1 * sig_y1
+    dsilu = sig_y1 * (1.0 + y1 * (1.0 - sig_y1))
+
+    d_y1 = g * dsilu * y2
+    d_y2 = g * silu_y1
+
+    tl.store(d1_ptrs, d_y1, mask=mask)
+    tl.store(d2_ptrs, d_y2, mask=mask)

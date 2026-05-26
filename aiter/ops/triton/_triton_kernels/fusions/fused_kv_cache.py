@@ -142,7 +142,6 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     q_nope_zeros_out_stride_d,
     kv_cache_stride_b,
     kv_cache_stride_h,
-    kv_cache_stride_blk,
     kv_cache_stride_d,
     k_scale_ptr,
     QH_PER_KH: tl.constexpr,
@@ -154,8 +153,6 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     BLOCK_DK_nope: tl.constexpr,
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr = 1,
-    SHUFFLED_KV_CACHE: tl.constexpr = False,
     OUTPUT_Q_NOPE_ZEROS: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
 ):
@@ -248,12 +245,6 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
             if pid_slot >= 0:
-                if BLOCK_SIZE > 1:
-                    pid_t_slot = pid_slot // BLOCK_SIZE
-                    pid_blk = pid_slot % BLOCK_SIZE
-                else:
-                    pid_t_slot = pid_slot
-                    pid_blk = 0
                 if HAVE_K_SCALE:
                     k_scale = tl.load(k_scale_ptr)
                 else:
@@ -278,6 +269,11 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     + pid_hk * k_pe_out_stride_h
                     + d_pe_offs * k_pe_out_stride_d
                 )
+                kv_cache_ptrs = (
+                    kv_cache_ptr
+                    + pid_slot * kv_cache_stride_b
+                    + pid_hk * kv_cache_stride_h
+                )
                 k_nope = tl.load(k_nope_ptrs)
                 k_pe = _unit_rope(
                     k_pe_ptrs,
@@ -296,52 +292,11 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                 k_pe = (k_pe.to(tl.float32) * k_scale_rcprl).to(
                     kv_cache_ptr.dtype.element_ty
                 )
-
-                if SHUFFLED_KV_CACHE:
-                    if kv_cache_ptr.dtype.element_ty == tl.bfloat16:
-                        K_WIDTH: tl.constexpr = 8
-                    else:
-                        K_WIDTH: tl.constexpr = 16
-                    dk_nope_offs_shfl = tl.arange(0, BLOCK_DK_nope // K_WIDTH).to(
-                        tl.int64
-                    )
-                    d_pe_offs_shfl = tl.arange(0, BLOCK_D_pe // K_WIDTH).to(tl.int64)
-                    k_width_shfl = tl.arange(0, K_WIDTH).to(tl.int64)
-                    k_nope = k_nope.reshape((BLOCK_DK_nope // K_WIDTH, K_WIDTH))
-                    k_pe = k_pe.reshape((BLOCK_D_pe // K_WIDTH, K_WIDTH))
-
-                    kv_cache_ptrs = (
-                        kv_cache_ptr
-                        + pid_t_slot * kv_cache_stride_b
-                        + pid_hk * kv_cache_stride_h
-                    )
-                    kv_cache_nope_offs = (
-                        (pid_blk // 16) * BLOCK_DK_nope * 16
-                        + (pid_blk % 16) * K_WIDTH
-                        + dk_nope_offs_shfl[:, None] * K_WIDTH * 16
-                        + k_width_shfl[None, :]
-                    ) * kv_cache_stride_d
-                    kv_cache_pe_offs = (
-                        (pid_blk // 16) * BLOCK_D_pe * 16
-                        + (pid_blk % 16) * K_WIDTH
-                        + d_pe_offs_shfl[:, None] * K_WIDTH * 16
-                        + k_width_shfl[None, :]
-                        + BLOCK_SIZE * BLOCK_DK_nope
-                    ) * kv_cache_stride_d
-
-                    tl.store(kv_cache_ptrs + kv_cache_nope_offs, k_nope)
-                    tl.store(kv_cache_ptrs + kv_cache_pe_offs, k_pe)
-                else:
-                    kv_cache_ptrs = (
-                        kv_cache_ptr
-                        + pid_t_slot * kv_cache_stride_b
-                        + pid_hk * kv_cache_stride_h
-                    )
-                    tl.store(kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope)
-                    tl.store(
-                        kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
-                        k_pe,
-                    )
+                tl.store(kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope)
+                tl.store(
+                    kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
+                    k_pe,
+                )
     else:
         pid = pid - B * QH + B * KH
         if pid < B_slot * KH:
@@ -349,12 +304,6 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             pid_hk = pid % KH
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
             if pid_slot >= 0:
-                if BLOCK_SIZE > 1:
-                    pid_t_slot = pid_slot // BLOCK_SIZE
-                    pid_blk = pid_slot % BLOCK_SIZE
-                else:
-                    pid_t_slot = pid_slot
-                    pid_blk = 0
                 if HAVE_K_SCALE:
                     k_scale = tl.load(k_scale_ptr)
                 else:
@@ -378,6 +327,11 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     + pid_hk * k_pe_out_stride_h
                     + d_pe_offs * k_pe_out_stride_d
                 )
+                kv_cache_ptrs = (
+                    kv_cache_ptr
+                    + pid_slot * kv_cache_stride_b
+                    + pid_hk * kv_cache_stride_h
+                )
                 k_nope = tl.load(k_nope_ptrs)
                 k_pe = tl.load(k_pe_ptrs)
                 tl.store(k_pe_out_ptrs, k_pe.to(k_pe_out_ptr.dtype.element_ty))
@@ -388,52 +342,11 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                 k_pe = (k_pe.to(tl.float32) * k_scale_rcprl).to(
                     kv_cache_ptr.dtype.element_ty
                 )
-
-                if SHUFFLED_KV_CACHE:
-                    if kv_cache_ptr.dtype.element_ty == tl.bfloat16:
-                        K_WIDTH: tl.constexpr = 8
-                    else:
-                        K_WIDTH: tl.constexpr = 16
-                    dk_nope_offs_shfl = tl.arange(0, BLOCK_DK_nope // K_WIDTH).to(
-                        tl.int64
-                    )
-                    d_pe_offs_shfl = tl.arange(0, BLOCK_D_pe // K_WIDTH).to(tl.int64)
-                    k_width_shfl = tl.arange(0, K_WIDTH).to(tl.int64)
-                    k_nope = k_nope.reshape((BLOCK_DK_nope // K_WIDTH, K_WIDTH))
-                    k_pe = k_pe.reshape((BLOCK_D_pe // K_WIDTH, K_WIDTH))
-
-                    kv_cache_ptrs = (
-                        kv_cache_ptr
-                        + pid_t_slot * kv_cache_stride_b
-                        + pid_hk * kv_cache_stride_h
-                    )
-                    kv_cache_nope_offs = (
-                        (pid_blk // 16) * BLOCK_DK_nope * 16
-                        + (pid_blk % 16) * K_WIDTH
-                        + dk_nope_offs_shfl[:, None] * K_WIDTH * 16
-                        + k_width_shfl[None, :]
-                    ) * kv_cache_stride_d
-                    kv_cache_pe_offs = (
-                        (pid_blk // 16) * BLOCK_D_pe * 16
-                        + (pid_blk % 16) * K_WIDTH
-                        + d_pe_offs_shfl[:, None] * K_WIDTH * 16
-                        + k_width_shfl[None, :]
-                        + BLOCK_SIZE * BLOCK_DK_nope
-                    ) * kv_cache_stride_d
-
-                    tl.store(kv_cache_ptrs + kv_cache_nope_offs, k_nope)
-                    tl.store(kv_cache_ptrs + kv_cache_pe_offs, k_pe)
-                else:
-                    kv_cache_ptrs = (
-                        kv_cache_ptr
-                        + pid_t_slot * kv_cache_stride_b
-                        + pid_hk * kv_cache_stride_h
-                    )
-                    tl.store(kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope)
-                    tl.store(
-                        kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
-                        k_pe,
-                    )
+                tl.store(kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope)
+                tl.store(
+                    kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
+                    k_pe,
+                )
 
 
 @triton.jit
@@ -507,8 +420,6 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     value_cache_stride_h,
     value_cache_stride_d,
     value_cache_stride_b,
-    value_cache_stride_slot_chunk,
-    value_cache_stride_x,
     zeros_out_stride_t,
     zeros_out_stride_h,
     zeros_out_stride_d,
@@ -524,7 +435,6 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     BLOCK_SIZE: tl.constexpr,
     X_SIZE: tl.constexpr,
     FLASH_LAYOUT: tl.constexpr,
-    VALUE_SHUFFLE_LAYOUT: tl.constexpr = False,
     HAVE_POS: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
@@ -557,8 +467,6 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     tl.assume(value_cache_stride_h >= 0)
     tl.assume(value_cache_stride_d >= 0)
     tl.assume(value_cache_stride_b >= 0)
-    tl.assume(value_cache_stride_slot_chunk >= 0)
-    tl.assume(value_cache_stride_x >= 0)
     tl.assume(zeros_out_stride_t >= 0)
     tl.assume(zeros_out_stride_h >= 0)
     tl.assume(zeros_out_stride_d >= 0)
@@ -697,25 +605,13 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     v_scale = 1
                 v_scale_rcprl = 1 / v_scale
                 v = tl.load(v_ptrs) * v_scale_rcprl
-                if VALUE_SHUFFLE_LAYOUT:
-                    slot_chunk = pid_b // X_SIZE
-                    x_off = pid_b % X_SIZE
-                    v_out_ptrs = (
-                        value_cache_ptr
-                        + pid_t_slot * value_cache_stride_t
-                        + pid_hk * value_cache_stride_h
-                        + slot_chunk * value_cache_stride_slot_chunk
-                        + d_pe_offs.to(tl.int64) * value_cache_stride_d
-                        + x_off * value_cache_stride_x
-                    )
-                else:
-                    v_out_ptrs = (
-                        value_cache_ptr
-                        + pid_t_slot * value_cache_stride_t
-                        + pid_hk * value_cache_stride_h
-                        + d_pe_offs.to(tl.int64) * value_cache_stride_d
-                        + pid_b * value_cache_stride_b
-                    )
+                v_out_ptrs = (
+                    value_cache_ptr
+                    + pid_t_slot * value_cache_stride_t
+                    + pid_hk * value_cache_stride_h
+                    + d_pe_offs.to(tl.int64) * value_cache_stride_d
+                    + pid_b * value_cache_stride_b
+                )
                 tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
     else:
         pid = pid - T * QH + T * KH
@@ -784,25 +680,13 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     v_scale = 1
                 v_scale_rcprl = 1 / v_scale
                 v = tl.load(v_ptrs) * v_scale_rcprl
-                if VALUE_SHUFFLE_LAYOUT:
-                    slot_chunk = pid_b // X_SIZE
-                    x_off = pid_b % X_SIZE
-                    v_out_ptrs = (
-                        value_cache_ptr
-                        + pid_t_slot * value_cache_stride_t
-                        + pid_hk * value_cache_stride_h
-                        + slot_chunk * value_cache_stride_slot_chunk
-                        + d_pe_offs * value_cache_stride_d
-                        + x_off * value_cache_stride_x
-                    )
-                else:
-                    v_out_ptrs = (
-                        value_cache_ptr
-                        + pid_t_slot * value_cache_stride_t
-                        + pid_hk * value_cache_stride_h
-                        + d_pe_offs * value_cache_stride_d
-                        + pid_b * value_cache_stride_b
-                    )
+                v_out_ptrs = (
+                    value_cache_ptr
+                    + pid_t_slot * value_cache_stride_t
+                    + pid_hk * value_cache_stride_h
+                    + d_pe_offs * value_cache_stride_d
+                    + pid_b * value_cache_stride_b
+                )
                 tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
 
 

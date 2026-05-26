@@ -5,11 +5,7 @@ import importlib.util
 import sys
 from types import SimpleNamespace
 
-# Try to import quant module
-try:
-    from . import quant
-except (ImportError, AttributeError):
-    quant = None
+from . import quant
 
 # Try to import comms module (requires iris)
 try:
@@ -31,9 +27,9 @@ except ImportError:
     IRIS_COMM_AVAILABLE = False
     comms = None
 
-__all__ = []
-if quant is not None:
-    __all__.append("quant")
+from .cross_entropy import cross_entropy_forward, cross_entropy_backward
+
+__all__ = ["quant", "cross_entropy_forward", "cross_entropy_backward"]
 
 if _COMMS_AVAILABLE:
     __all__.extend(
@@ -96,7 +92,6 @@ _BACKWARD_COMPAT_MAP = {
     "mha_onekernel_bwd": "attention.mha_onekernel_bwd",
     "mha_v3": "attention.mha_v3",
     "mha": "attention.mha",
-    "mla_decode": "attention.mla_decode",
     "mla_decode_rope": "attention.mla_decode_rope",
     "pa_decode": "attention.pa_decode",
     "pa_mqa_logits": "attention.pa_mqa_logits",
@@ -105,6 +100,7 @@ _BACKWARD_COMPAT_MAP = {
     "prefill_attention": "attention.prefill_attention",
     "unified_attention_sparse_mla": "attention.unified_attention_sparse_mla",
     "unified_attention": "attention.unified_attention",
+    "mxfp8_attention": "attention.mxfp8_attention",
     # Fusions modules (fusions/)
     "fused_kv_cache": "fusions.fused_kv_cache",
     "fused_mul_add": "fusions.fused_mul_add",
@@ -141,6 +137,7 @@ _BACKWARD_COMPAT_MAP = {
     # Quant modules (quant/)
     "fused_fp8_quant": "quant.fused_fp8_quant",
     "fused_mxfp4_quant": "quant.fused_mxfp4_quant",
+    "quant_mxfp8": "quant.quant_mxfp8",
 }
 
 

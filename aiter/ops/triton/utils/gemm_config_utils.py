@@ -1,4 +1,3 @@
-import copy
 import functools
 import json
 import os
@@ -44,101 +43,6 @@ def _load_config_file(
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
-def _get_gemm_config_cached(
-    config_name: str,
-    M: int,
-    N: int | None = None,
-    K: int | None = None,
-    bounds: tuple[int, ...] | None = None,
-    specialized_filename: str | None = None,
-) -> tuple[dict, bool]:
-    """
-    Internal cached implementation. Do NOT use this directly — use
-    ``get_gemm_config()`` instead, which returns a defensive deep-copy so
-    callers can freely mutate the returned dict without polluting the cache.
-    """
-    # Input validation
-    assert M >= 0, "M must be positive."
-    assert N is None or N > 0, "N must be positive when provided."
-    assert K is None or K > 0, "K must be positive when provided."
-    assert bounds is None or (
-        len(bounds) > 0
-        and all(x > 0 for x in bounds)
-        and all(x < y for x, y in zip(bounds, bounds[1:]))
-    ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
-
-    if not hasattr(_get_gemm_config_cached, "_config_cache"):
-        _get_gemm_config_cached._config_cache = {}
-
-    dev = arch_info.get_arch()
-    cache_key = f"{dev}_{config_name}"
-
-    if cache_key not in _get_gemm_config_cached._config_cache:
-        _get_gemm_config_cached._config_cache[cache_key] = {}
-
-        # Load default config (must exist)
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}.json"
-        _load_config_file(
-            _get_gemm_config_cached._config_cache,
-            cache_key,
-            fpath,
-            "default",
-            fpath_should_exist=True,
-        )
-
-    config_dict_key = "default"
-
-    # Handle custom specialized filename (for fused kernels with multiple N dims)
-    if specialized_filename is not None:
-        spec_key = specialized_filename
-        if spec_key not in _get_gemm_config_cached._config_cache[cache_key]:
-            fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-{specialized_filename}.json"
-            if _load_config_file(
-                _get_gemm_config_cached._config_cache, cache_key, fpath, spec_key
-            ):
-                config_dict_key = spec_key
-        else:
-            config_dict_key = spec_key
-
-    elif N is not None and K is not None:
-        nk_key = f"{N}_{K}"
-        if nk_key not in _get_gemm_config_cached._config_cache[cache_key]:
-            # load specialized config
-            fpath = (
-                f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-N={N}-K={K}.json"
-            )
-            if _load_config_file(
-                _get_gemm_config_cached._config_cache, cache_key, fpath, nk_key
-            ):
-                config_dict_key = nk_key
-        else:
-            config_dict_key = nk_key
-
-    config_dict = _get_gemm_config_cached._config_cache[cache_key][config_dict_key]
-
-    # use standard bounds unless custom bounds are passed
-    search_bounds = bounds if bounds is not None else STANDARD_M_BOUNDS
-
-    # Search for M_LEQ_x keys
-    for bound in search_bounds:
-        key = f"M_LEQ_{bound}"
-        if M <= bound and key in config_dict:
-            return dict(config_dict[key]), config_dict_key != "default"
-
-    # Search for M_GEQ_x keys
-    for bound in reversed(search_bounds):
-        key = f"M_GEQ_{bound}"
-        if M >= bound and key in config_dict:
-            return dict(config_dict[key]), config_dict_key != "default"
-
-    if "any" in config_dict:
-        return dict(config_dict["any"]), False
-
-    raise KeyError(
-        f"No matching configuration found for M={M}, N={N}, K={K} in config '{config_name}'."
-    )
-
-
 def get_gemm_config(
     config_name: str,
     M: int,
@@ -168,13 +72,89 @@ def get_gemm_config(
         specialized_filename: Custom specialized filename suffix (optional)
 
     Returns:
-        Dictionary with the config params (a fresh deep-copy safe to mutate),
+        Dictionary with the config params,
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
-    config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename
+    # Input validation
+    assert M >= 0, "M must be positive."
+    assert N is None or N > 0, "N must be positive when provided."
+    assert K is None or K > 0, "K must be positive when provided."
+    assert bounds is None or (
+        len(bounds) > 0
+        and all(x > 0 for x in bounds)
+        and all(x < y for x, y in zip(bounds, bounds[1:]))
+    ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
+
+    if not hasattr(get_gemm_config, "_config_cache"):
+        get_gemm_config._config_cache = {}
+
+    dev = arch_info.get_arch()
+    cache_key = f"{dev}_{config_name}"
+
+    if cache_key not in get_gemm_config._config_cache:
+        get_gemm_config._config_cache[cache_key] = {}
+
+        # Load default config (must exist)
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}.json"
+        _load_config_file(
+            get_gemm_config._config_cache,
+            cache_key,
+            fpath,
+            "default",
+            fpath_should_exist=True,
+        )
+
+    config_dict_key = "default"
+
+    # Handle custom specialized filename (for fused kernels with multiple N dims)
+    if specialized_filename is not None:
+        spec_key = specialized_filename
+        if spec_key not in get_gemm_config._config_cache[cache_key]:
+            fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-{specialized_filename}.json"
+            if _load_config_file(
+                get_gemm_config._config_cache, cache_key, fpath, spec_key
+            ):
+                config_dict_key = spec_key
+        else:
+            config_dict_key = spec_key
+
+    elif N is not None and K is not None:
+        nk_key = f"{N}_{K}"
+        if nk_key not in get_gemm_config._config_cache[cache_key]:
+            # load specialized config
+            fpath = (
+                f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-N={N}-K={K}.json"
+            )
+            if _load_config_file(
+                get_gemm_config._config_cache, cache_key, fpath, nk_key
+            ):
+                config_dict_key = nk_key
+        else:
+            config_dict_key = nk_key
+
+    config_dict = get_gemm_config._config_cache[cache_key][config_dict_key]
+
+    # use standard bounds unless custom bounds are passed
+    search_bounds = bounds if bounds is not None else STANDARD_M_BOUNDS
+
+    # Search for M_LEQ_x keys
+    for bound in search_bounds:
+        key = f"M_LEQ_{bound}"
+        if M <= bound and key in config_dict:
+            return dict(config_dict[key]), config_dict_key != "default"
+
+    # Search for M_GEQ_x keys
+    for bound in reversed(search_bounds):
+        key = f"M_GEQ_{bound}"
+        if M >= bound and key in config_dict:
+            return dict(config_dict[key]), config_dict_key != "default"
+
+    if "any" in config_dict:
+        return dict(config_dict["any"]), False
+
+    raise KeyError(
+        f"No matching configuration found for M={M}, N={N}, K={K} in config '{config_name}'."
     )
-    return copy.deepcopy(config), is_tuned
 
 
 def add_default_gemm_config_params(config: dict) -> dict:
@@ -216,21 +196,11 @@ def compute_splitk_params(config: dict, K: int) -> dict:
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
 
     if "BLOCK_SIZE_K" in config:
-        # If NUM_KSPLIT makes K too small, then BLOCK_K will decrease to be smaller than
-        # GROUP_K.
-        while (
-            config["NUM_KSPLIT"] > 1
-            and config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]
-        ):
-            config["NUM_KSPLIT"] = max(config["NUM_KSPLIT"] // 2, 1)
-            config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
-
-        # If BLOCK_SIZE_K is still too large with NUM_KSPLIT=1, fix it to equal K dim.
         if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
             config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
 
             if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-                config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 2
+                config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
 
         config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 

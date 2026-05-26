@@ -14,7 +14,9 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 __all__ = [
     "static_per_tensor_quant_fp8_i8",
+    "static_per_tensor_quant_fp8_i8_with_amax",
     "dynamic_per_tensor_quant_fp8_i8",
+    "dynamic_per_tensor_quant_fp8_i8_with_amax",
     "dynamic_per_token_quant_fp8_i8",
     "dynamic_mxfp4_quant",
     "_mxfp4_quant_op",
@@ -51,6 +53,32 @@ def static_per_tensor_quant_fp8_i8(
     return qx
 
 
+def static_per_tensor_quant_fp8_i8_with_amax(
+    qx: torch.Tensor,
+    x_in: torch.Tensor,
+    scale_in: torch.Tensor,
+    amax_out: torch.Tensor,
+):
+    """Like ``static_per_tensor_quant_fp8_i8`` but also computes ``amax(abs(x))``
+    into *amax_out* via atomic max, avoiding a separate amax reduction pass.
+
+    *amax_out* must be a 1-element float32 tensor, **pre-zeroed** by the caller.
+    """
+    _LOGGER.info(f"STATIC_PER_TENSOR_QUANT_FP8_I8_WITH_AMAX: x={tuple(x_in.shape)}")
+    assert scale_in.numel() == 1
+    rows = x_in.shape[0]
+    cols = x_in.shape[1]
+    NUM_COL_POW2 = triton.next_power_of_2(cols)
+    grid = lambda meta: (rows,)  # noqa: E731
+    _static_per_tensor_quant_fp8_i8_kernel[grid](
+        qx, x_in, scale_in, cols, x_in.stride(0),
+        NUM_COL_POW2=NUM_COL_POW2,
+        OUTPUT_AMAX=True,
+        amax_out_ptr=amax_out,
+    )
+    return qx
+
+
 def dynamic_per_tensor_quant_fp8_i8(
     qx: torch.Tensor, x_in: torch.Tensor, scale_out: torch.Tensor
 ):
@@ -82,6 +110,47 @@ def dynamic_per_tensor_quant_fp8_i8(
             if torch.is_floating_point(qx)
             else torch.iinfo(qx.dtype).max
         ),
+    )
+
+    _static_per_tensor_quant_fp8_i8_kernel[grid](
+        qx, x_in, scale_out, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
+    )
+
+    return qx, scale_out
+
+
+def dynamic_per_tensor_quant_fp8_i8_with_amax(
+    qx: torch.Tensor,
+    x_in: torch.Tensor,
+    scale_out: torch.Tensor,
+    amax_out: torch.Tensor,
+):
+    """Like ``dynamic_per_tensor_quant_fp8_i8`` but also outputs raw
+    ``amax(abs(x))`` into *amax_out* (pre-zeroed, 1-element float32).
+
+    The dynamic kernel already computes ``max(abs(x))`` internally to derive
+    ``scale_out``.  This variant additionally writes the raw amax value,
+    allowing the caller to feed it to the delayed scaling manager without an
+    extra amax reduction pass.
+    """
+    _LOGGER.info(f"DYNAMIC_PER_TENSOR_QUANT_FP8_I8_WITH_AMAX: x={tuple(x_in.shape)}")
+    rows = x_in.shape[0]
+    cols = x_in.shape[1]
+    NUM_COL_POW2 = triton.next_power_of_2(cols)
+    grid = lambda meta: (rows,)  # noqa: E731
+    _dynamic_per_tensor_quant_fp8_i8_kernel[grid](
+        x_in,
+        scale_out,
+        cols,
+        x_in.stride(0),
+        NUM_COL_POW2=NUM_COL_POW2,
+        DTYPE_MAX=(
+            torch.finfo(qx.dtype).max
+            if torch.is_floating_point(qx)
+            else torch.iinfo(qx.dtype).max
+        ),
+        OUTPUT_AMAX=True,
+        amax_out_ptr=amax_out,
     )
 
     _static_per_tensor_quant_fp8_i8_kernel[grid](

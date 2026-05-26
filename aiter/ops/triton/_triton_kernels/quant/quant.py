@@ -13,6 +13,8 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     cols: int,
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
+    OUTPUT_AMAX: tl.constexpr = False,
+    amax_out_ptr=None,
 ):
     pid = tl.program_id(axis=0)
     tl.assume(pid > 0)
@@ -22,7 +24,12 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     mask = tl.arange(0, NUM_COL_POW2) < cols
     x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")
 
+    if OUTPUT_AMAX:
+        row_amax = tl.max(tl.abs(x))
+        tl.atomic_max(amax_out_ptr, row_amax, sem="relaxed")
+
     scale = tl.load(scale_in_ptr)
+    scale = tl.where(scale > 0, scale, scale + 1.0)
     scale_recip = 1 / scale
 
     qx = (x * scale_recip).to(qx_ptr.dtype.element_ty)
@@ -38,6 +45,8 @@ def _dynamic_per_tensor_quant_fp8_i8_kernel(
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
+    OUTPUT_AMAX: tl.constexpr = False,
+    amax_out_ptr=None,
 ):
     pid = tl.program_id(axis=0)
     tl.assume(pid > 0)
@@ -49,6 +58,8 @@ def _dynamic_per_tensor_quant_fp8_i8_kernel(
 
     m = tl.max(tl.abs(x))
     tl.atomic_max(scale_out_ptr, m / DTYPE_MAX, sem="relaxed")
+    if OUTPUT_AMAX:
+        tl.atomic_max(amax_out_ptr, m, sem="relaxed")
 
 
 @triton.jit
