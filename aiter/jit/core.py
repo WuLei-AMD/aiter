@@ -1537,6 +1537,12 @@ def compile_ops(
                         func.__signature__ = sig
                         ann = {k: v.annotation for k, v in sig.parameters.items()}
                         ann["return"] = sig.return_annotation
+                        # tensor_like_types must be defined before the arg-check
+                        # loop below, which references it at every iteration.
+                        tensor_like_types = {torch.Tensor}
+                        if aiter_tensor_t is not object:
+                            tensor_like_types.add(aiter_tensor_t)
+
                         callargs = inspect.getcallargs(func, *args, **kwargs)
                         for el, arg in callargs.items():
                             expected_type = ann[el]
@@ -1546,6 +1552,13 @@ def compile_ops(
 
                             if origin is None:
                                 if not isinstance(arg, expected_type) and not (
+                                    # check_args runs before torch_to_aiter_pybind
+                                    # conversion, so args are still torch.Tensor when
+                                    # the annotation expects aiter_tensor_t. Both are
+                                    # in tensor_like_types; treat them as equivalent.
+                                    expected_type in tensor_like_types
+                                    and isinstance(arg, torch.Tensor)
+                                ) and not (
                                     any(el in str(expected_type) for el in enum_types)
                                     and isinstance(arg, int)
                                 ):
@@ -1568,10 +1581,6 @@ def compile_ops(
                         func_hints = typing.get_type_hints(func)
                         if ann["return"] is None:
                             func_hints["return"] = None
-
-                        tensor_like_types = {torch.Tensor}
-                        if aiter_tensor_t is not object:
-                            tensor_like_types.add(aiter_tensor_t)
 
                         def canonicalize_hint(hint):
                             if hint in tensor_like_types:
@@ -1623,8 +1632,17 @@ def compile_ops(
                             )
                     return True
 
-                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
-                if develop:
+                # Type-check against original torch.Tensor args before conversion.
+                if not func.arg_checked:
+                    func.arg_checked = check_args()
+
+                # develop=True + module supports aiter_tensor_t pybind protocol:
+                # convert torch.Tensor -> aiter_tensor_t before calling C++.
+                # Only applies to modules that expose _set_current_hip_stream
+                # (e.g. module_aiter_core); plain pybind modules (module_quant)
+                # accept torch.Tensor directly and must NOT be converted.
+                _use_aiter_pybind = develop and hasattr(module, "_set_current_hip_stream")
+                if _use_aiter_pybind:
                     import torch
 
                     from ..utility.dtypes import torch_to_aiter_pybind
@@ -1642,15 +1660,12 @@ def compile_ops(
                         for k, v in kwargs.items()
                     }
 
-                if not func.arg_checked:
-                    func.arg_checked = check_args()
-
                 if AITER_LOG_MORE == 2:
                     from ..test_common import log_args
 
                     log_args(func, *args, **kwargs)
 
-                if develop:
+                if _use_aiter_pybind:
                     module._set_current_hip_stream(
                         torch.cuda.current_stream().cuda_stream
                     )
