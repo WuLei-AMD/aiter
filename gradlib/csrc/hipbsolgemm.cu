@@ -107,7 +107,9 @@ std::map<at::ScalarType, hipDataType> dtype_map{{at::kHalf, HIP_R_16F},
 #ifdef ENABLE_TORCH_FP8
                                                 ,
                                                 {at::kFloat8_e4m3fnuz, HIP_R_8F_E4M3_FNUZ},
-                                                {at::kFloat8_e4m3fn, HIP_R_8F_E4M3}
+                                                {at::kFloat8_e4m3fn, HIP_R_8F_E4M3},
+                                                {at::kFloat8_e5m2fnuz, HIP_R_8F_E5M2_FNUZ},
+                                                {at::kFloat8_e5m2, HIP_R_8F_E5M2}
 #endif
 };
 
@@ -131,6 +133,7 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
                                                      int ldc,
                                                      const void* bias,
                                                      hipDataType intype,
+                                                     hipDataType intypeB,
                                                      hipDataType outtype,
                                                      const void* scaleA,
                                                      const void* scaleB,
@@ -173,11 +176,11 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
 #endif
     if(op_B == HIPBLAS_OP_N)
     {
-        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, k, n, ldb));
+        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intypeB, k, n, ldb));
     }
     else
     {
-        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, n, k, ldb));
+        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intypeB, n, k, ldb));
     }
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matC, outtype, m, n, ldc));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F));
@@ -713,6 +716,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
                                             const void* scaleC,
                                             const void* bias,
                                             hipDataType intype,
+                                            hipDataType intypeB,
                                             hipDataType outtype,
                                             const hipStream_t& stream,
                                             int solution_index = -1,
@@ -761,11 +765,11 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
 #endif
     if(op_B == HIPBLAS_OP_N)
     {
-        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, k, n, ldb));
+        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intypeB, k, n, ldb));
     }
     else
     {
-        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, n, k, ldb));
+        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intypeB, n, k, ldb));
     }
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matC, outtype, m, n, ldc));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F));
@@ -1072,14 +1076,25 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     auto mat2_sizes{mat2.sizes()};
 
     TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
-    TORCH_CHECK(mat1.dtype() == mat2.dtype(),
-                "expected mat1 and mat2 to have the same dtype, but got: ",
-                mat1.dtype(),
-                " != ",
-                mat2.dtype());
+    // Mixed FP8 (E5M2 x E4M3) is valid for hybrid backward — hipBLASLt/MFMA
+    // select the operand format per-matrix. Only require matching dtypes for
+    // non-FP8 inputs.
+    {
+        auto _t1 = mat1.options().dtype().toScalarType();
+        auto _t2 = mat2.options().dtype().toScalarType();
+        bool _both_fp8 = dtype_map.count(_t1) && dtype_map.count(_t2)
+            && (_t1 == at::kFloat8_e4m3fnuz || _t1 == at::kFloat8_e4m3fn
+                || _t1 == at::kFloat8_e5m2fnuz || _t1 == at::kFloat8_e5m2)
+            && (_t2 == at::kFloat8_e4m3fnuz || _t2 == at::kFloat8_e4m3fn
+                || _t2 == at::kFloat8_e5m2fnuz || _t2 == at::kFloat8_e5m2);
+        TORCH_CHECK(_t1 == _t2 || _both_fp8,
+                    "expected mat1 and mat2 to have the same dtype (or both FP8), but got: ",
+                    mat1.dtype(), " != ", mat2.dtype());
+    }
     TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
 
     auto inDtype{mat1.options().dtype().toScalarType()};
+    auto inDtypeB{mat2.options().dtype().toScalarType()};
     auto outDtype{out_dtype.has_value() ? out_dtype.value() : inDtype};
     auto options{at::TensorOptions().dtype(outDtype).device(at::kCUDA)};
     auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
@@ -1193,7 +1208,13 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
         d_scaleOut = static_cast<void*>(scaleOut.value().data_ptr());
     }
 
-    auto hipblasInType  = dtype_map.at(inDtype);
+    // Per-operand input types (mat1 and mat2 may differ for mixed FP8).
+    auto hipblasInTypeMat1 = dtype_map.at(inDtype);
+    auto hipblasInTypeMat2 = dtype_map.at(inDtypeB);
+    // ptrA/ptrB follow the same mat2<->mat1 swap as transpose_result below, so
+    // the A/B input types must be swapped in lockstep.
+    auto hipblasInType  = transpose_result ? hipblasInTypeMat2 : hipblasInTypeMat1;
+    auto hipblasInTypeB = transpose_result ? hipblasInTypeMat1 : hipblasInTypeMat2;
     auto hipblasOutType = dtype_map.at(outDtype);
 
     void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
@@ -1224,12 +1245,108 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
                                                     d_scaleOut,
                                                     bias_ptr,
                                                     hipblasInType,
+                                                    hipblasInTypeB,
                                                     hipblasOutType,
                                                     current_stream,
                                                     solution_index,
                                                     bpreshuffle_flag,
                                                     use_rowwise));
 
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// hipb_mm_mixed: explicit-op mixed-dtype FP8 GEMM.
+//
+// Unlike hipb_mm (which infers transpose from tensor strides and always routes
+// wgrad to the Ailk_Bjlk kernel), this entry takes op_a/op_b directly so the
+// caller can request the tuned TN kernel (Alik_Bljk) that TE uses.
+//
+// Computes  C = op_a(mat1) @ op_b(mat2)  in row-major torch terms:
+//   op_a(mat1) is (m, k),  op_b(mat2) is (k, n),  C is (m, n).
+// trans_a/trans_b indicate whether the corresponding operand is transposed
+// relative to its stored (row-major, contiguous) layout.
+//
+// Both operands must be row-major contiguous (the common case for grad/input).
+// ---------------------------------------------------------------------------
+torch::Tensor hipb_mm_mixed(const torch::Tensor& mat1,
+                            const torch::Tensor& mat2,
+                            const int solution_index,
+                            const bool trans_a,
+                            const bool trans_b,
+                            std::optional<torch::Tensor> scaleA,
+                            std::optional<torch::Tensor> scaleB,
+                            std::optional<c10::ScalarType> out_dtype)
+{
+    TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
+    TORCH_CHECK(mat1.is_contiguous() && mat2.is_contiguous(),
+                "hipb_mm_mixed requires row-major contiguous operands");
+
+    // Logical (row-major) dims after applying trans_*.
+    int64_t m = trans_a ? mat1.size(1) : mat1.size(0);
+    int64_t ka = trans_a ? mat1.size(0) : mat1.size(1);
+    int64_t kb = trans_b ? mat2.size(1) : mat2.size(0);
+    int64_t n = trans_b ? mat2.size(0) : mat2.size(1);
+    TORCH_CHECK(ka == kb, "contraction dims must match: ", ka, " vs ", kb);
+    int64_t k = ka;
+
+    auto inTypeA = mat1.options().dtype().toScalarType();
+    auto inTypeB = mat2.options().dtype().toScalarType();
+    auto outType = out_dtype.has_value() ? out_dtype.value() : at::kBFloat16;
+    auto options = at::TensorOptions().dtype(outType).device(at::kCUDA);
+    auto result  = torch::empty({m, n}, options);  // row-major (m, n)
+
+    // hipBLASLt is column-major. A row-major (r, c) tensor is a column-major
+    // (c, r) matrix with leading dim = c = stride(0). Compute C^T = B^T @ A^T
+    // in column-major so the row-major result comes out directly:
+    //   ptrA <- mat2, ptrB <- mat1, and op flags follow.
+    // For column-major, op_col == !op_row for each operand.
+    float one{1.0f}, zero{0.0f};
+    hipblasOperation_t opA_col = trans_b ? HIPBLAS_OP_T : HIPBLAS_OP_N;  // for mat2
+    hipblasOperation_t opB_col = trans_a ? HIPBLAS_OP_T : HIPBLAS_OP_N;  // for mat1
+    void* ptrA = static_cast<void*>(mat2.data_ptr());
+    void* ptrB = static_cast<void*>(mat1.data_ptr());
+    void* ptrC = static_cast<void*>(result.data_ptr());
+    int64_t lda = mat2.stride(0);   // = mat2 row-major cols
+    int64_t ldb = mat1.stride(0);   // = mat1 row-major cols
+    int64_t ldc = result.stride(0); // = n
+
+    void* d_scaleA = scaleB.has_value() ? scaleB.value().data_ptr() : nullptr;  // scale for ptrA(=mat2)
+    void* d_scaleB = scaleA.has_value() ? scaleA.value().data_ptr() : nullptr;  // scale for ptrB(=mat1)
+
+    auto hipTypeA = dtype_map.at(inTypeB);  // ptrA is mat2
+    auto hipTypeB = dtype_map.at(inTypeA);  // ptrB is mat1
+    auto hipTypeC = dtype_map.at(outType);
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(mat1));
+    const hipStream_t current_stream = at::hip::getCurrentHIPStream();
+
+    // Column-major GEMM computes (n x m) = op(ptrA)(n x k) * op(ptrB)(k x m).
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(hipblaslt_handle,
+                                                    opA_col,
+                                                    opB_col,
+                                                    n,
+                                                    m,
+                                                    k,
+                                                    &one,
+                                                    ptrA,
+                                                    lda,
+                                                    d_scaleA,
+                                                    ptrB,
+                                                    ldb,
+                                                    d_scaleB,
+                                                    &zero,
+                                                    ptrC,
+                                                    ldc,
+                                                    nullptr,
+                                                    nullptr,
+                                                    hipTypeA,
+                                                    hipTypeB,
+                                                    hipTypeC,
+                                                    current_stream,
+                                                    solution_index,
+                                                    false,
+                                                    false));
     return result;
 }
 
@@ -1248,14 +1365,22 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
     auto mat1_sizes{mat1.sizes()};
     auto mat2_sizes{mat2.sizes()};
     TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
-    TORCH_CHECK(mat1.dtype() == mat2.dtype(),
-                "expected mat1 and mat2 to have the same dtype, but got: ",
-                mat1.dtype(),
-                " != ",
-                mat2.dtype());
+    {
+        auto _t1 = mat1.options().dtype().toScalarType();
+        auto _t2 = mat2.options().dtype().toScalarType();
+        bool _both_fp8 = dtype_map.count(_t1) && dtype_map.count(_t2)
+            && (_t1 == at::kFloat8_e4m3fnuz || _t1 == at::kFloat8_e4m3fn
+                || _t1 == at::kFloat8_e5m2fnuz || _t1 == at::kFloat8_e5m2)
+            && (_t2 == at::kFloat8_e4m3fnuz || _t2 == at::kFloat8_e4m3fn
+                || _t2 == at::kFloat8_e5m2fnuz || _t2 == at::kFloat8_e5m2);
+        TORCH_CHECK(_t1 == _t2 || _both_fp8,
+                    "expected mat1 and mat2 to have the same dtype (or both FP8), but got: ",
+                    mat1.dtype(), " != ", mat2.dtype());
+    }
     TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
 
     auto inType{mat1.options().dtype().toScalarType()};
+    auto inTypeB{mat2.options().dtype().toScalarType()};
     auto outType{out_dtype.has_value() ? out_dtype.value() : inType};
 
     auto options{at::TensorOptions().dtype(outType).device(at::kCUDA)};
@@ -1305,7 +1430,10 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
     int64_t mat1_ld            = mat1_strides[(transpose_mat1 == transpose_result) ? 1 : 0];
     int64_t mat2_ld            = mat2_strides[(transpose_mat2 == transpose_result) ? 1 : 0];
     int64_t result_ld          = result.stride(transpose_result ? 0 : 1);
-    hipDataType hipblasInType  = dtype_map.at(inType);
+    hipDataType hipblasInTypeMat1 = dtype_map.at(inType);
+    hipDataType hipblasInTypeMat2 = dtype_map.at(inTypeB);
+    hipDataType hipblasInType  = transpose_result ? hipblasInTypeMat2 : hipblasInTypeMat1;
+    hipDataType hipblasInTypeB = transpose_result ? hipblasInTypeMat1 : hipblasInTypeMat2;
     hipDataType hipblasOutType = dtype_map.at(outType);
 
     void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
@@ -1351,6 +1479,7 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
                                                result_ld,
                                                bias_ptr,
                                                hipblasInType,
+                                               hipblasInTypeB,
                                                hipblasOutType,
                                                scaleA_ptr,
                                                scaleB_ptr,
@@ -1424,6 +1553,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scaleB")      = std::nullopt,
           py::arg("scaleOut")    = std::nullopt,
           py::arg("bpreshuffle") = std::nullopt);
+    m.def("hipb_mm_mixed",
+          &hipb_mm_mixed,
+          "hipb_mm_mixed (explicit op, mixed FP8)",
+          py::arg("mat1"),
+          py::arg("mat2"),
+          py::arg("solution_index"),
+          py::arg("trans_a"),
+          py::arg("trans_b"),
+          py::arg("scaleA")    = std::nullopt,
+          py::arg("scaleB")    = std::nullopt,
+          py::arg("out_dtype") = std::nullopt);
     m.def("hipb_findallsols",
           &hipb_findallsols,
           "hipb_findallsols",

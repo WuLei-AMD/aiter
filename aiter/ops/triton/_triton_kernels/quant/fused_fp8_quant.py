@@ -40,6 +40,80 @@ def _fp8_quant_op(
 
 
 @triton.jit
+def _fused_rms_fp8_quant_amax_large_m_small_n_kernel(
+    inp1_ptr,
+    weight1_ptr,
+    out1_fp8_ptr,
+    out1_ptr,
+    rsigma_ptr,
+    amax_ptr,
+    scale_ptr,
+    eps1,
+    M,
+    N,
+    inp1_row_stride,
+    inp1_col_stride,
+    out1_fp8_row_stride,
+    out1_fp8_col_stride,
+    out1_row_stride,
+    out1_col_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    DTYPE_MIN: tl.constexpr,
+    FIRST_INPUT_OUT: tl.constexpr,
+    OUTPUT_RSIGMA: tl.constexpr,
+    OUTPUT_AMAX: tl.constexpr,
+):
+    # Multi-row (BLOCK_M x BLOCK_N) specialization for large-M / small-N, mirror
+    # of _rmsnorm_kernel_large_m_small_n plus fused FP8 quant + amax. The generic
+    # per-row kernel holds a full row (BLOCK_N ~ N) per program, capping
+    # occupancy; tiling BLOCK_M rows per program raises it (~1.9x at N=4096).
+    pid_m = tl.program_id(0)
+    m_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_off = tl.arange(0, BLOCK_N)
+
+    mask_m = m_off < M
+    mask_n = n_off < N
+    mask = mask_m[:, None] & mask_n[None, :]
+
+    x = tl.load(
+        inp1_ptr + m_off[:, None] * inp1_row_stride + n_off[None, :] * inp1_col_stride,
+        mask=mask,
+        other=0.0,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+    w = tl.load(weight1_ptr + n_off, mask=mask_n, other=0.0).to(tl.float32)
+
+    x = tl.where(mask, x, 0.0)
+    sum_sq = tl.sum(x * x, axis=1)
+    rsigma = tl.math.rsqrt((sum_sq / N) + eps1)
+    norm = x * rsigma[:, None] * w[None, :]
+
+    if OUTPUT_RSIGMA:
+        tl.store(rsigma_ptr + m_off, rsigma, mask=mask_m)
+
+    if OUTPUT_AMAX:
+        tile_amax = tl.max(tl.where(mask, tl.abs(norm), 0.0))
+        tl.atomic_max(amax_ptr, tile_amax, sem="relaxed")
+
+    if FIRST_INPUT_OUT:
+        tl.store(
+            out1_ptr + m_off[:, None] * out1_row_stride + n_off[None, :] * out1_col_stride,
+            norm.to(out1_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+    scale = tl.load(scale_ptr).to(tl.float32)
+    out_fp8 = tl.clamp(norm * (1.0 / scale), DTYPE_MIN, DTYPE_MAX)
+    tl.store(
+        out1_fp8_ptr + m_off[:, None] * out1_fp8_row_stride + n_off[None, :] * out1_fp8_col_stride,
+        out_fp8.to(out1_fp8_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+@triton.jit
 def _fused_rms_fp8_per_tensor_static_quant_kernel(
     inp1_ptr,
     weight1_ptr,
@@ -51,6 +125,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
     out_res1_ptr,
     out1_ptr,
     rsigma_ptr,
+    amax_ptr,
     scale_ptr,
     eps1,
     eps2,
@@ -79,6 +154,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
     FIRST_INPUT_OUT: tl.constexpr,
     RMSNORM_CONVERT_TO_INP1_TYPE: tl.constexpr,
     OUTPUT_RSIGMA: tl.constexpr,
+    OUTPUT_AMAX: tl.constexpr,
 ):
     m_pid = tl.program_id(0)
     n_offs = tl.arange(0, BLOCK_SIZE_N)
@@ -105,6 +181,12 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
 
     if OUTPUT_RSIGMA:
         tl.store(rsigma_ptr + m_pid, rsigma_val)
+
+    # Fused amax on the normalized (pre-quant) output — matches TE delayed
+    # scaling, avoids a separate amax scan kernel.
+    if OUTPUT_AMAX:
+        row_amax = tl.max(tl.where(mask1, tl.abs(norm1), 0.0))
+        tl.atomic_max(amax_ptr, row_amax, sem="relaxed")
 
     if FIRST_INPUT_OUT:
         mask1 = n_offs < inp1_n_cols

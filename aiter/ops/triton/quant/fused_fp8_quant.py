@@ -3,6 +3,7 @@ import torch
 import triton
 import aiter
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
+    _fused_rms_fp8_quant_amax_large_m_small_n_kernel,
     _fused_rms_fp8_per_tensor_static_quant_kernel,
     _fused_rms_fp8_group_quant_kernel,
     _fused_flatten_fp8_group_quant_kernel,
@@ -34,6 +35,7 @@ def fused_rms_fp8_per_tensor_static_quant(
     output_unquantized_inp1=False,
     rmsnorm_convert_to_inp1_type=False,
     output_rsigma=False,
+    output_amax=False,
 ):
     """Fused RMSNorm + per-tensor static FP8 quantization.
 
@@ -44,9 +46,11 @@ def fused_rms_fp8_per_tensor_static_quant(
         4. perform fp8 quantization for inp1 only
 
     Returns:
-        (out1_fp8, out1, out2, out_res1) when output_rsigma=False, or
-        (out1_fp8, out1, out2, out_res1, rsigma) when output_rsigma=True.
-        rsigma has shape (M,) in float32 — the reciprocal of sqrt(mean(x^2)+eps).
+        (out1_fp8, out1, out2, out_res1) plus, appended in order, ``rsigma`` when
+        ``output_rsigma=True`` and ``amax`` when ``output_amax=True``.
+        rsigma has shape (M,) float32 — reciprocal of sqrt(mean(x^2)+eps).
+        amax has shape (1,) float32 — max(|RMSNorm(inp1)|) over the whole tensor,
+        computed inside the kernel (no extra amax scan).
     """
     M, N1 = inp1.shape
     BLOCK_SIZE_N = triton.next_power_of_2(N1)
@@ -84,6 +88,11 @@ def fused_rms_fp8_per_tensor_static_quant(
     if output_rsigma:
         rsigma = torch.empty((M,), dtype=torch.float32, device=inp1.device)
 
+    amax = None
+    if output_amax:
+        # zero-init: kernel does atomic_max into it
+        amax = torch.zeros((1,), dtype=torch.float32, device=inp1.device)
+
     out_res1 = None
     res1_row_stride = 0
     res1_col_stride = 0
@@ -115,6 +124,53 @@ def fused_rms_fp8_per_tensor_static_quant(
         else torch.iinfo(out1_fp8.dtype).max
     )
 
+    # Large-M / small-N specialization: for the plain norm+quant case (no second
+    # input, no residual add, no dtype convert), a multi-row tiled kernel raises
+    # occupancy ~1.9x at N<=4096 vs the single-row-per-program kernel. Falls
+    # through to the generic kernel for all other feature combinations.
+    _USE_LARGE_M_SMALL_N = (
+        inp2 is None
+        and res1 is None
+        and not rmsnorm_convert_to_inp1_type
+        and N1 <= 4096
+    )
+    if _USE_LARGE_M_SMALL_N:
+        BLOCK_M = 4
+        _fused_rms_fp8_quant_amax_large_m_small_n_kernel[
+            (triton.cdiv(M, BLOCK_M),)
+        ](
+            inp1,
+            inp1_weight,
+            out1_fp8,
+            out1,
+            rsigma,
+            amax,
+            inp1_scale,
+            inp1_epsilon,
+            M,
+            N1,
+            inp1.stride(0),
+            inp1.stride(1),
+            out1_fp8.stride(0),
+            out1_fp8.stride(1),
+            out1_row_stride,
+            out1_col_stride,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_SIZE_N,
+            DTYPE_MAX=DTYPE_MAX,
+            DTYPE_MIN=-DTYPE_MAX,
+            FIRST_INPUT_OUT=output_unquantized_inp1,
+            OUTPUT_RSIGMA=output_rsigma,
+            OUTPUT_AMAX=output_amax,
+            num_warps=8,
+        )
+        out = [out1_fp8, out1, out2, out_res1]
+        if output_rsigma:
+            out.append(rsigma)
+        if output_amax:
+            out.append(amax)
+        return tuple(out)
+
     _fused_rms_fp8_per_tensor_static_quant_kernel[(M,)](
         inp1,
         inp1_weight,
@@ -126,6 +182,7 @@ def fused_rms_fp8_per_tensor_static_quant(
         out_res1,
         out1,
         rsigma,
+        amax,
         inp1_scale,
         inp1_epsilon,
         inp2_epsilon,
@@ -154,12 +211,16 @@ def fused_rms_fp8_per_tensor_static_quant(
         FIRST_INPUT_OUT=output_unquantized_inp1,
         RMSNORM_CONVERT_TO_INP1_TYPE=rmsnorm_convert_to_inp1_type,
         OUTPUT_RSIGMA=output_rsigma,
+        OUTPUT_AMAX=output_amax,
         num_warps=num_warps,
     )
 
+    out = [out1_fp8, out1, out2, out_res1]
     if output_rsigma:
-        return out1_fp8, out1, out2, out_res1, rsigma
-    return out1_fp8, out1, out2, out_res1
+        out.append(rsigma)
+    if output_amax:
+        out.append(amax)
+    return tuple(out)
 
 
 def fused_rms_fp8_group_quant(
