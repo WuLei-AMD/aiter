@@ -34,6 +34,7 @@ def fused_rms_fp8_per_tensor_static_quant(
     output_unquantized_inp1=False,
     rmsnorm_convert_to_inp1_type=False,
     output_rsigma=False,
+    output_amax=False,
 ):
     """Fused RMSNorm + per-tensor static FP8 quantization.
 
@@ -84,6 +85,12 @@ def fused_rms_fp8_per_tensor_static_quant(
     if output_rsigma:
         rsigma = torch.empty((M,), dtype=torch.float32, device=inp1.device)
 
+    amax = None
+    if output_amax:
+        # zero-init: kernel does atomic_max into it (in-kernel amax on the
+        # normalized output, avoids a separate abs().amax() pass).
+        amax = torch.zeros((1,), dtype=torch.float32, device=inp1.device)
+
     out_res1 = None
     res1_row_stride = 0
     res1_col_stride = 0
@@ -126,6 +133,7 @@ def fused_rms_fp8_per_tensor_static_quant(
         out_res1,
         out1,
         rsigma,
+        amax,
         inp1_scale,
         inp1_epsilon,
         inp2_epsilon,
@@ -154,12 +162,16 @@ def fused_rms_fp8_per_tensor_static_quant(
         FIRST_INPUT_OUT=output_unquantized_inp1,
         RMSNORM_CONVERT_TO_INP1_TYPE=rmsnorm_convert_to_inp1_type,
         OUTPUT_RSIGMA=output_rsigma,
+        OUTPUT_AMAX=output_amax,
         num_warps=num_warps,
     )
 
+    out = [out1_fp8, out1, out2, out_res1]
     if output_rsigma:
-        return out1_fp8, out1, out2, out_res1, rsigma
-    return out1_fp8, out1, out2, out_res1
+        out.append(rsigma)
+    if output_amax:
+        out.append(amax)
+    return tuple(out)
 
 
 def fused_rms_fp8_group_quant(

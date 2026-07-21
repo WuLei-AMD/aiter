@@ -1352,7 +1352,7 @@ def _flash_attn_forward(
             window_size_right,
             return_lse,
             return_softmax,
-            how_v3_bf16_cvt,
+            2,  # how_v3_bf16_cvt: hardcode rtz (gfx942 faster than rtna)
             out,
             bias,
             alibi_slopes,
@@ -1714,7 +1714,7 @@ def _flash_attn_backward(
             window_size_right,
             False if is_950_1block else deterministic,
             False if is_950_1block else is_v3_atomic_fp32,
-            how_v3_bf16_cvt,
+            2 if get_gfx() == "gfx942" else how_v3_bf16_cvt,  # rtz on gfx942
             dq,
             dk,
             dv,

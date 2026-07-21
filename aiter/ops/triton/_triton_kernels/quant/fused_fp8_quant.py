@@ -51,6 +51,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
     out_res1_ptr,
     out1_ptr,
     rsigma_ptr,
+    amax_ptr,
     scale_ptr,
     eps1,
     eps2,
@@ -79,6 +80,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
     FIRST_INPUT_OUT: tl.constexpr,
     RMSNORM_CONVERT_TO_INP1_TYPE: tl.constexpr,
     OUTPUT_RSIGMA: tl.constexpr,
+    OUTPUT_AMAX: tl.constexpr,
 ):
     m_pid = tl.program_id(0)
     n_offs = tl.arange(0, BLOCK_SIZE_N)
@@ -105,6 +107,12 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
 
     if OUTPUT_RSIGMA:
         tl.store(rsigma_ptr + m_pid, rsigma_val)
+
+    # In-kernel amax on the normalized (pre-quant) output for delayed scaling,
+    # avoiding a separate abs().amax() pass.
+    if OUTPUT_AMAX:
+        row_amax = tl.max(tl.where(mask1, tl.abs(norm1), 0.0))
+        tl.atomic_max(amax_ptr, row_amax, sem="relaxed")
 
     if FIRST_INPUT_OUT:
         mask1 = n_offs < inp1_n_cols

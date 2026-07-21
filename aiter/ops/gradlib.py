@@ -50,6 +50,35 @@ def hipb_mm(
 ) -> torch.Tensor: ...
 
 
+def gen_hipb_mm_mixed_fake_tensor(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    solution_index: int,
+    trans_a: bool,
+    trans_b: bool,
+    scaleA: Optional[torch.Tensor] = None,
+    scaleB: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+):
+    m = mat1.size(1) if trans_a else mat1.size(0)
+    n = mat2.size(0) if trans_b else mat2.size(1)
+    out_dtype = out_dtype if out_dtype is not None else torch.bfloat16
+    return torch.empty((m, n), dtype=out_dtype, device=mat1.device)
+
+
+@compile_ops("module_hipbsolgemm", gen_fake=gen_hipb_mm_mixed_fake_tensor)
+def hipb_mm_mixed(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    solution_index: int,
+    trans_a: bool,
+    trans_b: bool,
+    scaleA: Optional[torch.Tensor] = None,
+    scaleB: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor: ...
+
+
 @compile_ops("module_hipbsolgemm")
 def hipb_findallsols(
     mat1: torch.Tensor,
