@@ -511,3 +511,84 @@ def moe_general_routing_inputs(
     )
 
     return o, expert_frequency
+
+
+def moe_pre_routed_inputs(
+    x: torch.Tensor,
+    router_scores: torch.Tensor,
+    expert_frequency: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor | None,
+    w2: torch.Tensor,
+    b2: torch.Tensor | None,
+    stream_id: int,
+    activation_type: ActivationType,
+    is_inference_mode_enabled: bool = False,
+    concat_layout: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run SonicMoE on tokens already grouped by local expert.
+
+    ``x`` and ``router_scores`` must use the expert-major order described by
+    ``expert_frequency``. This is the format produced by Megatron's AllToAll
+    token dispatcher, so rebuilding and sorting general-routing metadata is
+    unnecessary.
+    """
+    del stream_id
+
+    T = x.size(0)
+    E = w2.size(-1)
+    if expert_frequency.numel() != E:
+        raise ValueError(
+            f"Expected {E} local expert counts, got {expert_frequency.numel()}"
+        )
+    if router_scores.numel() != T:
+        raise ValueError(
+            f"Expected one router score per pre-routed token ({T}), "
+            f"got {router_scores.numel()}"
+        )
+    if router_scores.dtype != torch.float32:
+        router_scores = router_scores.float()
+
+    expert_frequency = expert_frequency.to(device=x.device, dtype=torch.int32)
+    expert_frequency_offset = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32, device=x.device),
+            expert_frequency.cumsum(dim=0, dtype=torch.int32),
+        )
+    )
+    identity = torch.arange(T, dtype=torch.int32, device=x.device)
+
+    a, h = _UpProjection.apply(
+        x,
+        w1,
+        b1,
+        expert_frequency_offset,
+        T,
+        1,
+        identity,
+        identity,
+        identity,
+        None,
+        False,
+        activation_type,
+        is_inference_mode_enabled,
+        concat_layout,
+    )
+
+    o = _DownProjection.apply(
+        a,
+        h,
+        w2,
+        b2,
+        router_scores.reshape(T, 1),
+        expert_frequency_offset,
+        T,
+        1,
+        identity,
+        identity,
+        identity,
+        None,
+        False,
+        activation_type,
+    )
+    return o, expert_frequency
