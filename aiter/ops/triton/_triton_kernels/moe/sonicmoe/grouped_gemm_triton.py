@@ -1,3 +1,5 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -7,6 +9,59 @@ from aiter.ops.triton.utils.sonicmoe_config_utils import (
     get_grouped_gemm_fwd_config,
     split_launch_config,
 )
+
+
+_QWEN3_FWD_CONFIGS = {
+    (1536, 2048, 16, True): {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+    },
+    (2048, 768, 16, False): {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+    },
+    (768, 2048, 16, False): {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+    },
+    (2048, 1536, 16, False): {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+    },
+}
+
+_QWEN3_DW_CONFIGS = {
+    (1536, 2048, 16, True): {
+        "BLOCK_K": 128,
+        "BLOCK_N": 128,
+        "BLOCK_T": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+    },
+    (2048, 768, 16, False): {
+        "BLOCK_K": 128,
+        "BLOCK_N": 128,
+        "BLOCK_T": 32,
+        "num_warps": 4,
+        "num_stages": 2,
+    },
+}
+
+
+def _use_qwen3_tuned_configs() -> bool:
+    return os.environ.get("SONIC_MOE_USE_QWEN3_TUNED_GEMM", "0") == "1"
 
 
 def _get_fwd_autotune_configs():
@@ -90,6 +145,11 @@ def _grouped_gemm_kernel(
             expert_start = s
             expert_end = f
         cumulative_blocks += blocks_this_expert
+
+    # Launching an upper bound avoids copying cu_seqlens to the CPU just to
+    # calculate the exact grid size.
+    if pid >= cumulative_blocks:
+        return
 
     local_pid = pid
     for e in range(E):
@@ -333,23 +393,17 @@ def grouped_gemm(
     K_dim = B.shape[1]
     N = B.shape[2]
 
-    TK = A.shape[0] if A_idx is None else cu_seqlens[-1].item()
+    TK = A.shape[0] if A_idx is None else A_idx.numel()
 
     if out is None:
         out = torch.empty(TK, N, dtype=A.dtype, device=A.device)
 
-    cu_seqlens_cpu = cu_seqlens.cpu()
-
     def grid(META):
-        return (
-            _compute_grid_fwd(cu_seqlens_cpu, N, E, META["BLOCK_M"], META["BLOCK_N"]),
-        )
+        max_m_blocks = triton.cdiv(TK, META["BLOCK_M"]) + E - 1
+        return (max_m_blocks * triton.cdiv(N, META["BLOCK_N"]),)
 
-    fwd_cfg = get_grouped_gemm_fwd_config(N, K_dim, E)
-    common = (
-        A,
-        B,
-        out,
+    launch_args = (
+        A, B, out,
         cu_seqlens,
         bias if bias is not None else A,
         A_idx if A_idx is not None else cu_seqlens,
@@ -364,19 +418,26 @@ def grouped_gemm(
         bias.stride(0) if bias is not None else 0,
         bias.stride(1) if bias is not None else 0,
     )
-    kwargs = {
+    launch_meta = {
         "N": N,
         "K": K_dim,
         "E": E,
+        "GROUP_SIZE_M": 8,
         "HAS_BIAS": (bias is not None),
         "HAS_GATHER_IDX": (A_idx is not None),
         "HAS_SCATTER_IDX": (scatter_idx is not None),
     }
-    if fwd_cfg is not None:
+    fixed = _QWEN3_FWD_CONFIGS.get((N, K_dim, E, A_idx is not None))
+    fwd_cfg = get_grouped_gemm_fwd_config(N, K_dim, E)
+    if _use_qwen3_tuned_configs() and fixed is not None:
+        _grouped_gemm_kernel[grid](*launch_args, **launch_meta, **fixed)
+    elif fwd_cfg is not None:
         constexprs, launch = split_launch_config(fwd_cfg)
-        _grouped_gemm_kernel[grid](*common, **kwargs, **constexprs, **launch)
+        _grouped_gemm_kernel[grid](
+            *launch_args, **launch_meta, **constexprs, **launch
+        )
     else:
-        _grouped_gemm_kernel_autotuned[grid](*common, **kwargs, GROUP_SIZE_M=8)
+        _grouped_gemm_kernel_autotuned[grid](*launch_args, **launch_meta)
     return out
 
 
@@ -399,30 +460,29 @@ def _grouped_gemm_dw(
         num_n_blocks = triton.cdiv(N, META["BLOCK_N"])
         return (E * num_k_blocks * num_n_blocks,)
 
-    common = (
-        A,
-        B,
-        out,
+    launch_args = (
+        A, B, out,
         cu_seqlens,
         A_idx if A_idx is not None else cu_seqlens,
-        A.stride(0),
-        A.stride(1),
-        B.stride(0),
-        B.stride(1),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
     )
-    kwargs = {
+    launch_meta = {
         "N": N,
         "K": K_dim,
         "E": E,
-        "HAS_GATHER_IDX": (A_idx is not None),
+        "HAS_GATHER_IDX": A_idx is not None,
     }
+    fixed = _QWEN3_DW_CONFIGS.get((N, K_dim, E, A_idx is not None))
     dw_cfg = get_grouped_gemm_dw_config(N, K_dim, E)
-    if dw_cfg is not None:
+    if _use_qwen3_tuned_configs() and fixed is not None:
+        _grouped_gemm_dw_kernel[grid](*launch_args, **launch_meta, **fixed)
+    elif dw_cfg is not None:
         constexprs, launch = split_launch_config(dw_cfg)
-        _grouped_gemm_dw_kernel[grid](*common, **kwargs, **constexprs, **launch)
+        _grouped_gemm_dw_kernel[grid](
+            *launch_args, **launch_meta, **constexprs, **launch
+        )
     else:
-        _grouped_gemm_dw_kernel_autotuned[grid](*common, **kwargs)
+        _grouped_gemm_dw_kernel_autotuned[grid](*launch_args, **launch_meta)
     return out
