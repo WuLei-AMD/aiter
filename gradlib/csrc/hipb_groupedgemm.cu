@@ -26,24 +26,38 @@ constexpr size_t kMultiStreamWorkspaceBytes = 64 * 1024 * 1024;
 
 struct HipblasLtContext
 {
+    int device;
     hipblasLtHandle_t handle = nullptr;
     void* workspace          = nullptr;
     hipblaslt_ext::UserArguments* host_user_args   = nullptr;
     hipblaslt_ext::UserArguments* device_user_args = nullptr;
     size_t user_args_capacity                       = 0;
+    hipEvent_t completion                            = nullptr;
+    bool has_pending_work                            = false;
 
-    HipblasLtContext()
+    explicit HipblasLtContext(int device_) : device(device_)
     {
+        TORCH_CHECK(hipSetDevice(device) == hipSuccess,
+                    "selecting device for grouped GEMM context failed");
         TORCH_CHECK(
             hipblasLtCreate(&handle) == HIPBLAS_STATUS_SUCCESS,
             "hipblasLtCreate failed for grouped GEMM");
         TORCH_CHECK(
             hipMalloc(&workspace, kWorkspaceBytes) == hipSuccess,
             "hipMalloc failed for grouped GEMM workspace");
+        TORCH_CHECK(hipEventCreate(&completion) == hipSuccess,
+                    "hipEventCreate failed for grouped GEMM completion");
     }
 
     ~HipblasLtContext()
     {
+        int previous_device = device;
+        hipGetDevice(&previous_device);
+        hipSetDevice(device);
+        if(has_pending_work)
+            hipEventSynchronize(completion);
+        if(completion != nullptr)
+            hipEventDestroy(completion);
         if(workspace != nullptr)
             hipFree(workspace);
         if(host_user_args != nullptr)
@@ -52,6 +66,23 @@ struct HipblasLtContext
             hipFree(device_user_args);
         if(handle != nullptr)
             hipblasLtDestroy(handle);
+        hipSetDevice(previous_device);
+    }
+
+    void wait_for_completion()
+    {
+        if(!has_pending_work)
+            return;
+        TORCH_CHECK(hipEventSynchronize(completion) == hipSuccess,
+                    "waiting for grouped GEMM scratch reuse failed");
+        has_pending_work = false;
+    }
+
+    void mark_pending(hipStream_t stream)
+    {
+        TORCH_CHECK(hipEventRecord(completion, stream) == hipSuccess,
+                    "recording grouped GEMM completion failed");
+        has_pending_work = true;
     }
 
     void reserve_user_args(size_t count)
@@ -73,7 +104,7 @@ struct HipblasLtContext
     }
 };
 
-thread_local std::unique_ptr<HipblasLtContext> context;
+thread_local std::unordered_map<int, std::unique_ptr<HipblasLtContext>> contexts;
 
 struct MultiStreamContext
 {
@@ -375,11 +406,12 @@ void run_multistream_hipblaslt_gemm(MultiStreamContext& context,
         "launching per-expert hipBLASLt GEMM failed");
 }
 
-HipblasLtContext& get_context()
+HipblasLtContext& get_context(int device)
 {
-    if(!context)
-        context = std::make_unique<HipblasLtContext>();
-    return *context;
+    auto& context_for_device = contexts[device];
+    if(!context_for_device)
+        context_for_device = std::make_unique<HipblasLtContext>(device);
+    return *context_for_device;
 }
 
 struct GroupedProblem
@@ -402,6 +434,7 @@ struct GroupedProblem
     std::vector<hipblaslt_ext::GemmInputs> inputs;
     std::vector<float> alphas;
     std::vector<float> betas;
+    std::vector<int64_t> empty_experts;
 };
 
 GroupedProblem make_problem(const torch::Tensor& a,
@@ -412,6 +445,10 @@ GroupedProblem make_problem(const torch::Tensor& a,
                             const std::optional<torch::Tensor>& bias)
 {
     TORCH_CHECK(a.is_cuda() && b.is_cuda() && out.is_cuda(), "grouped GEMM tensors must be on GPU");
+    TORCH_CHECK(b.get_device() == a.get_device() && out.get_device() == a.get_device(),
+                "grouped GEMM tensors must be on the same GPU");
+    TORCH_CHECK(!cu_seqlens.is_cuda() || cu_seqlens.get_device() == a.get_device(),
+                "grouped GEMM offsets must be on CPU or the same GPU as A");
     TORCH_CHECK(a.scalar_type() == at::kBFloat16 || a.scalar_type() == at::kHalf,
                 "grouped GEMM supports BF16 and FP16");
     TORCH_CHECK(b.scalar_type() == a.scalar_type() && out.scalar_type() == a.scalar_type(),
@@ -444,6 +481,9 @@ GroupedProblem make_problem(const torch::Tensor& a,
     {
         TORCH_CHECK(!a_is_transposed, "bias is not supported for wgrad grouped GEMM");
         TORCH_CHECK(bias->is_cuda() && bias->is_contiguous(), "grouped GEMM bias must be contiguous on GPU");
+        TORCH_CHECK(bias->get_device() == a.get_device() &&
+                        bias->scalar_type() == a.scalar_type(),
+                    "grouped GEMM bias must match the input device and dtype");
         TORCH_CHECK(bias->dim() == 2 && bias->size(0) == experts && bias->size(1) == out.size(1),
                     "grouped GEMM bias must be [E, N]");
     }
@@ -477,6 +517,7 @@ GroupedProblem make_problem(const torch::Tensor& a,
     problem.inputs.reserve(experts);
     problem.alphas.reserve(experts);
     problem.betas.reserve(experts);
+    problem.empty_experts.reserve(experts);
     for(int64_t expert = 0; expert < experts; ++expert)
     {
         const int64_t begin = offset_data[expert];
@@ -484,7 +525,10 @@ GroupedProblem make_problem(const torch::Tensor& a,
         TORCH_CHECK(begin <= end, "cu_seqlens must be nondecreasing");
         const int64_t rows = end - begin;
         if(rows == 0)
+        {
+            problem.empty_experts.push_back(expert);
             continue;
+        }
 
         problem.epilogues.emplace_back();
         problem.epilogues.back().setMode(
@@ -530,7 +574,8 @@ GroupedProblem make_problem(const torch::Tensor& a,
             input.setC(out_base + begin * output_n * element_size);
             input.setD(out_base + begin * output_n * element_size);
             if(bias.has_value())
-                input.setBias(bias_base + expert * output_n * element_size);
+                input.setBias(
+                    bias_base + expert * output_n * bias->element_size());
         }
         problem.batch.push_back(1);
         problem.stride_a.push_back(0);
@@ -651,20 +696,34 @@ supported_algorithms(hipblasLtHandle_t handle,
 
 } // namespace
 
-torch::Tensor hipb_grouped_mm(const torch::Tensor& a,
-                              const torch::Tensor& b,
-                              const torch::Tensor& cu_seqlens,
-                              torch::Tensor out,
-                              bool a_is_transposed,
-                              std::optional<torch::Tensor> bias,
-                              int solution_index)
+void hipb_grouped_mm(const torch::Tensor& a,
+                     const torch::Tensor& b,
+                     const torch::Tensor& cu_seqlens,
+                     torch::Tensor out,
+                     bool a_is_transposed,
+                     std::optional<torch::Tensor> bias,
+                     int solution_index)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(at::device_of(a));
     auto problem = make_problem(a, b, cu_seqlens, out, a_is_transposed, bias);
+    auto stream = torch::hip::getCurrentHIPStream().stream();
+    if(a_is_transposed)
+    {
+        auto* out_data = static_cast<char*>(out.data_ptr());
+        const size_t expert_bytes =
+            out.size(1) * out.size(2) * out.element_size();
+        for(const int64_t expert : problem.empty_experts)
+            TORCH_CHECK(
+                hipMemsetAsync(
+                    out_data + expert * expert_bytes, 0, expert_bytes, stream) ==
+                    hipSuccess,
+                "zeroing empty-expert grouped wgrad failed");
+    }
     if(problem.m.empty())
-        return out;
+        return;
 
-    auto& ctx    = get_context();
+    auto& ctx    = get_context(a.get_device());
+    ctx.wait_for_completion();
     auto grouped = make_grouped_gemm(ctx.handle, problem, a_is_transposed);
     hipblasLtMatmulAlgo_t algorithm;
     if(solution_index >= 0)
@@ -685,7 +744,6 @@ torch::Tensor hipb_grouped_mm(const torch::Tensor& a,
         algorithm = algorithms.front().algo;
     }
 
-    auto stream = torch::hip::getCurrentHIPStream().stream();
     ctx.reserve_user_args(problem.m.size());
     grouped->getDefaultValueForDeviceUserArguments(ctx.host_user_args);
     for(size_t index = 0; index < problem.n.size(); ++index)
@@ -697,15 +755,17 @@ torch::Tensor hipb_grouped_mm(const torch::Tensor& a,
                        hipMemcpyHostToDevice,
                        stream) == hipSuccess,
         "copying hipBLASLt grouped user arguments failed");
+    ctx.mark_pending(stream);
     auto status = grouped->initialize(algorithm, ctx.workspace, true, stream);
+    ctx.mark_pending(stream);
     TORCH_CHECK(status == HIPBLAS_STATUS_SUCCESS,
                 "hipBLASLt grouped initialize failed: ",
                 hipblasStatusToString(status));
     status = grouped->run(ctx.device_user_args, stream);
+    ctx.mark_pending(stream);
     TORCH_CHECK(status == HIPBLAS_STATUS_SUCCESS,
                 "hipBLASLt grouped run failed: ",
                 hipblasStatusToString(status));
-    return out;
 }
 
 std::vector<int> hipb_grouped_findallsols(const torch::Tensor& a,
@@ -719,7 +779,8 @@ std::vector<int> hipb_grouped_findallsols(const torch::Tensor& a,
     auto problem = make_problem(a, b, cu_seqlens, out, a_is_transposed, bias);
     if(problem.m.empty())
         return {};
-    auto& ctx    = get_context();
+    auto& ctx    = get_context(a.get_device());
+    ctx.wait_for_completion();
     auto grouped = make_grouped_gemm(ctx.handle, problem, a_is_transposed);
     auto results =
         supported_algorithms(ctx.handle, *grouped, a_is_transposed, problem.dtype, 256);
@@ -730,17 +791,23 @@ std::vector<int> hipb_grouped_findallsols(const torch::Tensor& a,
     return indices;
 }
 
-torch::Tensor hipb_multistream_mm(const torch::Tensor& a,
-                                  const torch::Tensor& b,
-                                  const torch::Tensor& cu_seqlens,
-                                  torch::Tensor out,
-                                  bool a_is_transposed,
-                                  std::optional<torch::Tensor> bias,
-                                  bool b_is_transposed)
+void hipb_multistream_mm(const torch::Tensor& a,
+                         const torch::Tensor& b,
+                         const torch::Tensor& cu_seqlens,
+                         torch::Tensor out,
+                         bool a_is_transposed,
+                         std::optional<torch::Tensor> bias,
+                         bool b_is_transposed)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(at::device_of(a));
     TORCH_CHECK(a.is_cuda() && b.is_cuda() && out.is_cuda(),
                 "multi-stream GEMM tensors must be on GPU");
+    TORCH_CHECK(b.get_device() == a.get_device() &&
+                    out.get_device() == a.get_device(),
+                "multi-stream GEMM tensors must be on the same GPU");
+    TORCH_CHECK(!cu_seqlens.is_cuda() ||
+                    cu_seqlens.get_device() == a.get_device(),
+                "multi-stream offsets must be on CPU or the same GPU as A");
     TORCH_CHECK(a.dim() == 2 && a.is_contiguous() && b.is_contiguous() && out.is_contiguous(),
                 "multi-stream GEMM requires contiguous tensors");
     TORCH_CHECK(a.scalar_type() == b.scalar_type(),
@@ -751,16 +818,23 @@ torch::Tensor hipb_multistream_mm(const torch::Tensor& a,
     TORCH_CHECK(out.scalar_type() == at::kBFloat16 || out.scalar_type() == at::kHalf ||
                     out.scalar_type() == at::kFloat,
                 "multi-stream GEMM output supports BF16, FP16, and FP32");
+    TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.numel() >= 2,
+                "multi-stream offsets must contain E+1 values");
     auto offsets = cu_seqlens.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64))
                        .contiguous();
     const auto* offset_data = offsets.data_ptr<int64_t>();
     const int64_t experts   = offsets.numel() - 1;
     TORCH_CHECK(experts >= 1 && offset_data[0] == 0 && offset_data[experts] == a.size(0),
                 "invalid multi-stream GEMM expert offsets");
+    for(int64_t expert = 0; expert < experts; ++expert)
+        TORCH_CHECK(offset_data[expert] <= offset_data[expert + 1],
+                    "multi-stream GEMM offsets must be nondecreasing");
     if(a_is_transposed)
     {
         TORCH_CHECK(!b_is_transposed,
                     "multi-stream wgrad does not support a transposed B");
+        TORCH_CHECK(!bias.has_value(),
+                    "multi-stream wgrad does not support bias");
         TORCH_CHECK(b.dim() == 2 && b.size(0) == a.size(0),
                     "multi-stream wgrad B shape is invalid");
         TORCH_CHECK(out.dim() == 3 && out.size(0) == experts &&
@@ -783,8 +857,9 @@ torch::Tensor hipb_multistream_mm(const torch::Tensor& a,
         {
             TORCH_CHECK(
                 bias->is_cuda() && bias->is_contiguous() &&
+                    bias->get_device() == a.get_device() &&
                     bias->scalar_type() == out.scalar_type(),
-                "multi-stream bias must be a contiguous GPU tensor matching output dtype");
+                "multi-stream bias must be contiguous and match the output device and dtype");
             TORCH_CHECK(bias->dim() == 2 && bias->size(0) == experts &&
                             bias->size(1) == out.size(1),
                         "multi-stream bias must be [E, N]");
@@ -814,7 +889,7 @@ torch::Tensor hipb_multistream_mm(const torch::Tensor& a,
         }
     }
     if(offset_data[experts] == 0)
-        return out;
+        return;
 
     TORCH_CHECK(hipEventRecord(ctx.ready, current) == hipSuccess,
                 "recording multi-stream ready event failed");
@@ -836,69 +911,86 @@ torch::Tensor hipb_multistream_mm(const torch::Tensor& a,
     const auto output_dtype = out.scalar_type() == at::kBFloat16
                                   ? HIP_R_16BF
                                   : (out.scalar_type() == at::kHalf ? HIP_R_16F : HIP_R_32F);
-    for(int64_t expert = 0; expert < experts; ++expert)
+    std::array<bool, MultiStreamContext::kStreams> launched{};
+    try
     {
-        const int64_t begin = offset_data[expert];
-        const int64_t rows  = offset_data[expert + 1] - begin;
-        if(rows == 0)
-            continue;
-        const int stream_index = expert % streams_used;
-        if(a_is_transposed)
+        for(int64_t expert = 0; expert < experts; ++expert)
         {
-            const int64_t output_k = a.size(1);
-            const int64_t output_n = b.size(1);
-            run_multistream_hipblaslt_gemm(
-                ctx,
-                stream_index,
-                input_dtype,
-                output_dtype,
-                HIPBLAS_OP_N,
-                HIPBLAS_OP_T,
-                output_n,
-                output_k,
-                rows,
-                b_base + begin * output_n * input_element_size,
-                output_n,
-                a_base + begin * output_k * input_element_size,
-                output_k,
-                out_base + expert * output_k * output_n * output_element_size,
-                output_n,
-                nullptr);
+            const int64_t begin = offset_data[expert];
+            const int64_t rows  = offset_data[expert + 1] - begin;
+            if(rows == 0)
+                continue;
+            const int stream_index = expert % streams_used;
+            if(a_is_transposed)
+            {
+                const int64_t output_k = a.size(1);
+                const int64_t output_n = b.size(1);
+                run_multistream_hipblaslt_gemm(
+                    ctx,
+                    stream_index,
+                    input_dtype,
+                    output_dtype,
+                    HIPBLAS_OP_N,
+                    HIPBLAS_OP_T,
+                    output_n,
+                    output_k,
+                    rows,
+                    b_base + begin * output_n * input_element_size,
+                    output_n,
+                    a_base + begin * output_k * input_element_size,
+                    output_k,
+                    out_base + expert * output_k * output_n * output_element_size,
+                    output_n,
+                    nullptr);
+            }
+            else
+            {
+                const int64_t input_k  = a.size(1);
+                const int64_t output_n = b_is_transposed ? b.size(1) : b.size(2);
+                run_multistream_hipblaslt_gemm(
+                    ctx,
+                    stream_index,
+                    input_dtype,
+                    output_dtype,
+                    b_is_transposed ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                    HIPBLAS_OP_N,
+                    output_n,
+                    rows,
+                    input_k,
+                    b_base + expert * input_k * output_n * input_element_size,
+                    b_is_transposed ? input_k : output_n,
+                    a_base + begin * input_k * input_element_size,
+                    input_k,
+                    out_base + begin * output_n * output_element_size,
+                    output_n,
+                    bias_base == nullptr
+                        ? nullptr
+                        : bias_base + expert * output_n * output_element_size);
+            }
+            launched[stream_index] = true;
         }
-        else
-        {
-            const int64_t input_k  = a.size(1);
-            const int64_t output_n = b_is_transposed ? b.size(1) : b.size(2);
-            run_multistream_hipblaslt_gemm(
-                ctx,
-                stream_index,
-                input_dtype,
-                output_dtype,
-                b_is_transposed ? HIPBLAS_OP_T : HIPBLAS_OP_N,
-                HIPBLAS_OP_N,
-                output_n,
-                rows,
-                input_k,
-                b_base + expert * input_k * output_n * input_element_size,
-                b_is_transposed ? input_k : output_n,
-                a_base + begin * input_k * input_element_size,
-                input_k,
-                out_base + begin * output_n * output_element_size,
-                output_n,
-                bias_base == nullptr
-                    ? nullptr
-                    : bias_base + expert * output_n * output_element_size);
-        }
+    }
+    catch(...)
+    {
+        // A later expert may fail after earlier GEMMs were already queued on
+        // side streams. Drain those launches before propagating the error so a
+        // Python fallback cannot race them while writing the same output.
+        for(int index = 0; index < streams_used; ++index)
+            if(launched[index])
+                hipStreamSynchronize(ctx.streams[index]);
+        throw;
     }
 
     for(int index = 0; index < streams_used; ++index)
     {
+        if(!launched[index])
+            continue;
         TORCH_CHECK(hipEventRecord(ctx.done[index], ctx.streams[index]) == hipSuccess,
                     "recording multi-stream completion event failed");
         TORCH_CHECK(hipStreamWaitEvent(current, ctx.done[index], 0) == hipSuccess,
                     "joining multi-stream GEMM onto caller stream failed");
     }
-    return out;
+    return;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
