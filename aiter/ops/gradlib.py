@@ -139,7 +139,7 @@ def gen_hipb_grouped_mm_fake_tensor(
     cu_seqlens: torch.Tensor,
     out: torch.Tensor,
     a_is_transposed: bool = False,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     solution_index: int = -1,
 ) -> torch.Tensor:
     return out
@@ -152,7 +152,7 @@ def hipb_grouped_mm(
     cu_seqlens: torch.Tensor,
     out: torch.Tensor,
     a_is_transposed: bool = False,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     solution_index: int = -1,
 ) -> torch.Tensor: ...
 
@@ -163,7 +163,7 @@ def gen_hipb_multistream_mm_fake_tensor(
     cu_seqlens: torch.Tensor,
     out: torch.Tensor,
     a_is_transposed: bool = False,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     b_is_transposed: bool = False,
 ) -> torch.Tensor:
     return out
@@ -176,7 +176,7 @@ def hipb_multistream_mm(
     cu_seqlens: torch.Tensor,
     out: torch.Tensor,
     a_is_transposed: bool = False,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     b_is_transposed: bool = False,
 ) -> torch.Tensor: ...
 
