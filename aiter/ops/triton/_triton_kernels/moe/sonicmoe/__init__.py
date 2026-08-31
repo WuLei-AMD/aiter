@@ -1,7 +1,13 @@
 import torch
 import torch.nn.functional as F
 
-from .activation_kernels import activation_fwd
+from .grouped_gemm_triton import (
+    _local_tensor,
+    clear_registered_host_cu_seqlens,
+    grouped_gemm,
+    register_host_cu_seqlens,
+)
+from .activation_kernels import activation_fwd, activation_bwd
 from .backward import (
     _down_projection_backward_act,
     _token_broadcast_backward,
@@ -96,9 +102,19 @@ class _UpProjection(torch.autograd.Function):
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
         concat_layout: bool = False,
+        inputs_are_pre_routed: bool = False,
     ) -> torch.Tensor:
         T, H = x.shape
-        I_full, _H_w, E = w1.shape
+        E = expert_frequency_offset.numel() - 1
+        grouped_weight_layout = w1.shape[0] == E
+        if grouped_weight_layout:
+            E_w, H_w, I_full = w1.shape
+            assert E_w == E
+            gemm_w1 = w1
+        else:
+            I_full, H_w, E_w = w1.shape
+            assert E_w == E
+            gemm_w1 = w1.permute(2, 1, 0)
         is_glu_activation = is_glu(activation_type)
         I = I_full // 2 if is_glu_activation else I_full
         TK = total_expert_freq
@@ -109,11 +125,11 @@ class _UpProjection(torch.autograd.Function):
         h = torch.empty(TK, I_full, dtype=x.dtype, device=x.device)
         grouped_gemm(
             x,
-            w1.permute(2, 1, 0),  # (E, H, I_full)
+            gemm_w1,  # (E, H, I_full)
             expert_frequency_offset,
             out=h,
             bias=b1,
-            A_idx=x_gather_idx,
+            A_idx=None if inputs_are_pre_routed else x_gather_idx,
         )
 
         # Step 2: activation
@@ -133,6 +149,8 @@ class _UpProjection(torch.autograd.Function):
         )
         ctx.is_glu_activation = is_glu_activation
         ctx.concat_layout = concat_layout and is_glu_activation
+        ctx.grouped_weight_layout = grouped_weight_layout
+        ctx.inputs_are_pre_routed = inputs_are_pre_routed
 
         ctx.save_for_backward(
             x,
@@ -179,13 +197,14 @@ class _UpProjection(torch.autograd.Function):
         db1 = None if b1 is None else torch.empty_like(b1)
 
         _up_projection_backward_act(
-            w1=w1,
+            w1=_local_tensor(w1),
             dx_expanded=dx_expanded,
             dh=dh,
-            db1=db1,
+            db1=_local_tensor(db1),
             expert_frequency_offset=expert_frequency_offset,
             is_glu_activation=is_glu_activation,
             concat_layout=concat_layout,
+            grouped_weight_layout=ctx.grouped_weight_layout,
         )
 
         # dW1: x^T @ dh per expert
@@ -202,22 +221,24 @@ class _UpProjection(torch.autograd.Function):
                 else dh
             ),
             expert_frequency_offset,
-            out=dw1.permute(2, 1, 0),  # (E, H, I_full) output
-            A_idx=x_gather_idx,
+            out=dw1 if ctx.grouped_weight_layout else dw1.permute(2, 1, 0),
+            A_idx=None if ctx.inputs_are_pre_routed else x_gather_idx,
             A_is_transposed=True,
         )
 
-        dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=dh.device)
-
-        _token_broadcast_backward(
-            dx_reduced=dx_reduced,
-            dx_expanded=dx_expanded,
-            s_reverse_scatter_idx=s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(E if is_each_token_has_variable_activated_experts else K),
-            H=H,
-            is_varlen_K=is_each_token_has_variable_activated_experts,
-        )
+        if ctx.inputs_are_pre_routed:
+            dx_reduced = dx_expanded
+        else:
+            dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=dh.device)
+            _token_broadcast_backward(
+                dx_reduced=dx_reduced,
+                dx_expanded=dx_expanded,
+                s_reverse_scatter_idx=s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
+                varlen_K_max=(E if is_each_token_has_variable_activated_experts else K),
+                H=H,
+                is_varlen_K=is_each_token_has_variable_activated_experts,
+            )
 
         return dx_reduced, dw1, db1, *[None] * 13
 
@@ -240,14 +261,24 @@ class _DownProjection(torch.autograd.Function):
         num_activated_expert_per_token_offset: torch.Tensor,
         is_varlen_K: bool,
         activation_type: ActivationType,
+        concat_layout: bool,
     ) -> torch.Tensor:
         TK = a.size(0)
-        H, _I, E = w2.shape
+        E = expert_frequency_offset.numel() - 1
+        grouped_weight_layout = w2.shape[0] == E
+        if grouped_weight_layout:
+            E_w, I, H = w2.shape
+            assert E_w == E
+            gemm_w2 = w2
+        else:
+            H, I, E_w = w2.shape
+            assert E_w == E
+            gemm_w2 = w2.permute(2, 1, 0)
 
         # Grouped GEMM: y = a @ w2 per expert
         # w2 is (H, I, E), permute to (E, I, H) for B: A=(TK, I), B=(E, I, H) -> C=(TK, H)
         y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
-        grouped_gemm(a, w2.permute(2, 1, 0), expert_frequency_offset, out=y, bias=b2)
+        grouped_gemm(a, gemm_w2, expert_frequency_offset, out=y, bias=b2)
 
         # Router weighted reduction
         o = torch.empty(T, H, device=a.device, dtype=a.dtype)
@@ -268,6 +299,8 @@ class _DownProjection(torch.autograd.Function):
         ctx.K = K
         ctx.is_varlen_K = is_varlen_K
         ctx.activation_type = activation_type
+        ctx.grouped_weight_layout = grouped_weight_layout
+        ctx.concat_layout = concat_layout
 
         ctx.save_for_backward(
             h,
@@ -311,17 +344,19 @@ class _DownProjection(torch.autograd.Function):
         _down_projection_backward_act(
             dout=dout,
             h=h,
-            w2=w2,
+            w2=_local_tensor(w2),
             dh=dh,
             ds=ds,
-            b2=b2,
-            db2=db2,
+            b2=_local_tensor(b2),
+            db2=_local_tensor(db2),
             a_prime=a_prime,
             topk_scores=topk_scores,
             expert_frequency_offset=expert_frequency_offset,
             x_gather_idx=x_gather_idx,
             s_scatter_idx=s_scatter_idx,
             activation_type=activation_type.value,
+            grouped_weight_layout=ctx.grouped_weight_layout,
+            concat_layout=ctx.concat_layout,
         )
 
         # dW2: a_prime^T @ dy per expert
@@ -337,7 +372,7 @@ class _DownProjection(torch.autograd.Function):
             a_prime,
             dy,
             expert_frequency_offset,
-            out=dw2.permute(2, 1, 0),
+            out=dw2 if ctx.grouped_weight_layout else dw2.permute(2, 1, 0),
             A_is_transposed=True,
         )
 
@@ -407,6 +442,7 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         is_inference_mode_enabled,
         concat_layout,
+        False,
     )
 
     o = _DownProjection.apply(
@@ -424,6 +460,7 @@ def moe_TC_softmax_topk_layer(
         None,
         False,
         activation_type,
+        concat_layout,
     )
 
     return o, router_logits, expert_frequency
@@ -491,6 +528,7 @@ def moe_general_routing_inputs(
         activation_type,
         is_inference_mode_enabled,
         concat_layout,
+        False,
     )
 
     o = _DownProjection.apply(
@@ -508,6 +546,7 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
         True,
         activation_type,
+        concat_layout,
     )
 
     return o, expert_frequency
@@ -536,7 +575,11 @@ def moe_pre_routed_inputs(
     del stream_id
 
     T = x.size(0)
-    E = w2.size(-1)
+    E = (
+        w2.size(0)
+        if w1.size(0) == w2.size(0) == expert_frequency.numel()
+        else w2.size(-1)
+    )
     if expert_frequency.numel() != E:
         raise ValueError(
             f"Expected {E} local expert counts, got {expert_frequency.numel()}"
@@ -549,6 +592,9 @@ def moe_pre_routed_inputs(
     if router_scores.dtype != torch.float32:
         router_scores = router_scores.float()
 
+    host_expert_frequency = None
+    if expert_frequency.device.type == "cpu":
+        host_expert_frequency = expert_frequency.to(dtype=torch.int64, copy=False).contiguous()
     expert_frequency = expert_frequency.to(device=x.device, dtype=torch.int32)
     expert_frequency_offset = torch.cat(
         (
@@ -556,6 +602,18 @@ def moe_pre_routed_inputs(
             expert_frequency.cumsum(dim=0, dtype=torch.int32),
         )
     )
+    if host_expert_frequency is not None:
+        host_expert_frequency_offset = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int64, device="cpu"),
+                host_expert_frequency.cumsum(dim=0, dtype=torch.int64),
+            )
+        )
+        register_host_cu_seqlens(
+            expert_frequency_offset, host_expert_frequency_offset
+        )
+    else:
+        clear_registered_host_cu_seqlens(expert_frequency_offset)
     identity = torch.arange(T, dtype=torch.int32, device=x.device)
 
     a, h = _UpProjection.apply(
@@ -573,6 +631,7 @@ def moe_pre_routed_inputs(
         activation_type,
         is_inference_mode_enabled,
         concat_layout,
+        True,
     )
 
     o = _DownProjection.apply(
@@ -590,5 +649,6 @@ def moe_pre_routed_inputs(
         None,
         False,
         activation_type,
+        concat_layout,
     )
     return o, expert_frequency

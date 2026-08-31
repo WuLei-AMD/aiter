@@ -1,4 +1,6 @@
+import logging
 import os
+from collections import OrderedDict
 
 import torch
 import triton
@@ -9,6 +11,74 @@ from aiter.ops.triton.utils.sonicmoe_config_utils import (
     get_grouped_gemm_fwd_config,
     split_launch_config,
 )
+
+
+logger = logging.getLogger(__name__)
+_LOGGED_BACKENDS: set[str] = set()
+_MULTISTREAM_CALLS = 0
+_HOST_CU_SEQLENS_CACHE_MAX_ENTRIES = 4096
+_HOST_CU_SEQLENS_CACHE: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
+
+
+def _cu_seqlens_cache_key(cu_seqlens: torch.Tensor) -> tuple[int, int]:
+    device_index = cu_seqlens.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return device_index, cu_seqlens.data_ptr()
+
+
+def register_host_cu_seqlens(
+    cu_seqlens: torch.Tensor, host_cu_seqlens: torch.Tensor
+) -> None:
+    """Associate GPU offsets with dispatcher-produced CPU offsets.
+
+    The multi-stream backend launches one hipBLASLt GEMM per expert and therefore
+    needs offsets on the host. Keeping the host copy produced at the Megatron
+    dispatcher boundary avoids synchronously copying the same GPU tensor before
+    every forward and backward GEMM.
+    """
+    if cu_seqlens.device.type != "cuda":
+        raise ValueError("cu_seqlens cache keys must be GPU tensors")
+    host_cu_seqlens = host_cu_seqlens.to(
+        device="cpu", dtype=torch.int64, copy=False
+    ).contiguous()
+    key = _cu_seqlens_cache_key(cu_seqlens)
+    _HOST_CU_SEQLENS_CACHE[key] = host_cu_seqlens
+    _HOST_CU_SEQLENS_CACHE.move_to_end(key)
+    while len(_HOST_CU_SEQLENS_CACHE) > _HOST_CU_SEQLENS_CACHE_MAX_ENTRIES:
+        _HOST_CU_SEQLENS_CACHE.popitem(last=False)
+
+
+def _registered_host_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor | None:
+    if cu_seqlens.device.type != "cuda":
+        return cu_seqlens
+    key = _cu_seqlens_cache_key(cu_seqlens)
+    host_cu_seqlens = _HOST_CU_SEQLENS_CACHE.get(key)
+    if host_cu_seqlens is not None:
+        _HOST_CU_SEQLENS_CACHE.move_to_end(key)
+    return host_cu_seqlens
+
+
+def clear_registered_host_cu_seqlens(cu_seqlens: torch.Tensor) -> None:
+    """Discard a stale host-offset entry for a newly allocated GPU tensor."""
+    if cu_seqlens.device.type == "cuda":
+        _HOST_CU_SEQLENS_CACHE.pop(_cu_seqlens_cache_key(cu_seqlens), None)
+
+
+def _log_backend_once(backend: str) -> None:
+    if os.environ.get("SONIC_MOE_LOG_BACKEND", "0") != "1":
+        return
+    if backend not in _LOGGED_BACKENDS:
+        logger.warning("Sonic grouped GEMM active backend: %s", backend)
+        _LOGGED_BACKENDS.add(backend)
+
+
+def _local_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is not None and hasattr(tensor, "to_local"):
+        return tensor.to_local()
+    return tensor
 
 
 _QWEN3_FWD_CONFIGS = {
@@ -377,6 +447,245 @@ def _compute_grid_fwd(cu_seqlens_cpu, N, E, BLOCK_M, BLOCK_N):
 
 
 def grouped_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    A_idx: torch.Tensor | None = None,
+    scatter_idx: torch.Tensor | None = None,
+    A_is_transposed: bool = False,
+    B_is_transposed: bool = False,
+):
+    backend = os.environ.get("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton").lower()
+    if backend not in {"triton", "hipblaslt", "multistream", "auto"}:
+        raise ValueError(
+            "SONIC_MOE_GROUPED_GEMM_BACKEND must be triton, hipblaslt, "
+            "multistream, or auto"
+        )
+    if backend == "triton":
+        triton_b = B.transpose(1, 2) if B_is_transposed else B
+        return _grouped_gemm_triton(
+            A, triton_b, cu_seqlens, out, bias, A_idx, scatter_idx, A_is_transposed
+        )
+    if backend == "multistream":
+        return _grouped_gemm_multistream(
+            A,
+            B,
+            cu_seqlens,
+            out,
+            bias,
+            A_idx,
+            scatter_idx,
+            A_is_transposed,
+            B_is_transposed,
+        )
+
+    try:
+        return _grouped_gemm_hipblaslt(
+            A,
+            B,
+            cu_seqlens,
+            out,
+            bias,
+            A_idx,
+            scatter_idx,
+            A_is_transposed,
+            B_is_transposed,
+        )
+    except (RuntimeError, ValueError):
+        if backend == "hipblaslt":
+            raise
+        try:
+            return _grouped_gemm_multistream(
+                A,
+                B,
+                cu_seqlens,
+                out,
+                bias,
+                A_idx,
+                scatter_idx,
+                A_is_transposed,
+                B_is_transposed,
+            )
+        except (RuntimeError, ValueError):
+            triton_b = B.transpose(1, 2) if B_is_transposed else B
+            return _grouped_gemm_triton(
+                A,
+                triton_b,
+                cu_seqlens,
+                out,
+                bias,
+                A_idx,
+                scatter_idx,
+                A_is_transposed,
+            )
+
+
+def _grouped_gemm_hipblaslt(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    A_idx: torch.Tensor | None,
+    scatter_idx: torch.Tensor | None,
+    A_is_transposed: bool,
+    B_is_transposed: bool,
+):
+    from aiter.ops.gradlib import hipb_grouped_mm
+
+    A = _local_tensor(A)
+    B = _local_tensor(B)
+    bias = _local_tensor(bias)
+    out = _local_tensor(out)
+    work_a = A.index_select(0, A_idx) if A_idx is not None else A
+    work_a = work_a.contiguous()
+    work_b = (
+        B.contiguous()
+        if A_is_transposed or B_is_transposed
+        else B.transpose(1, 2).contiguous()
+    )
+    counts = cu_seqlens.contiguous()
+
+    if A_is_transposed:
+        if scatter_idx is not None:
+            raise ValueError("scatter_idx is invalid for a grouped wgrad")
+        E = counts.numel() - 1
+        shape = (E, work_a.shape[1], work_b.shape[1])
+    else:
+        shape = (work_a.shape[0], work_b.shape[1])
+
+    direct_out = (
+        out is not None
+        and out.is_contiguous()
+        and scatter_idx is None
+        and tuple(out.shape) == shape
+    )
+    work_out = out if direct_out else torch.empty(shape, dtype=A.dtype, device=A.device)
+    if A_is_transposed:
+        work_out.zero_()
+
+    hipb_grouped_mm(
+        work_a,
+        work_b,
+        counts,
+        work_out,
+        A_is_transposed,
+        bias.contiguous() if bias is not None else None,
+    )
+
+    if out is None:
+        if scatter_idx is None:
+            return work_out
+        out = torch.empty_like(work_out)
+    if scatter_idx is not None:
+        out.index_copy_(0, scatter_idx, work_out)
+    elif work_out is not out:
+        out.copy_(work_out)
+    return out
+
+
+def _grouped_gemm_multistream(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    A_idx: torch.Tensor | None,
+    scatter_idx: torch.Tensor | None,
+    A_is_transposed: bool,
+    B_is_transposed: bool,
+):
+    global _MULTISTREAM_CALLS
+
+    from aiter.ops.gradlib import hipb_multistream_mm
+
+    _log_backend_once("hipblaslt_multistream")
+    A = _local_tensor(A)
+    B = _local_tensor(B)
+    bias = _local_tensor(bias)
+    out = _local_tensor(out)
+    work_a = A.index_select(0, A_idx) if A_idx is not None else A
+    work_a = work_a.contiguous()
+    work_b = B.contiguous()
+    host_cu_seqlens = _registered_host_cu_seqlens(cu_seqlens)
+    counts = (
+        host_cu_seqlens
+        if host_cu_seqlens is not None
+        else cu_seqlens.contiguous()
+    )
+    if A_is_transposed:
+        if scatter_idx is not None:
+            raise ValueError("scatter_idx is invalid for a grouped wgrad")
+        shape = (counts.numel() - 1, work_a.shape[1], work_b.shape[1])
+    else:
+        shape = (
+            work_a.shape[0],
+            work_b.shape[1] if B_is_transposed else work_b.shape[2],
+        )
+
+    input_dtype = torch.promote_types(work_a.dtype, work_b.dtype)
+    if A_is_transposed and out is not None:
+        input_dtype = torch.promote_types(input_dtype, out.dtype)
+    work_a = work_a.to(dtype=input_dtype)
+    work_b = work_b.to(dtype=input_dtype)
+    direct_out = (
+        out is not None
+        and out.is_contiguous()
+        and out.dtype == input_dtype
+        and scatter_idx is None
+        and tuple(out.shape) == shape
+    )
+    work_out = (
+        out
+        if direct_out
+        else torch.empty(shape, dtype=input_dtype, device=A.device)
+    )
+    _MULTISTREAM_CALLS += 1
+    local_rank = os.environ.get("LOCAL_RANK", "0")
+    trace = os.environ.get("SONIC_MOE_TRACE_GEMM", "0") == "1" and (
+        local_rank == "0" or os.environ.get("SONIC_MOE_TRACE_ALL_RANKS", "0") == "1"
+    )
+    if trace:
+        expert_rows = (counts[1:] - counts[:-1]).cpu().tolist()
+        logger.warning(
+            "Sonic multi-stream rank=%s call %d start: A=%s B=%s out=%s "
+            "rows=%s wgrad=%s",
+            local_rank,
+            _MULTISTREAM_CALLS,
+            tuple(work_a.shape),
+            tuple(work_b.shape),
+            tuple(work_out.shape),
+            expert_rows,
+            A_is_transposed,
+        )
+    hipb_multistream_mm(
+        work_a,
+        work_b,
+        counts,
+        work_out,
+        A_is_transposed,
+        bias.to(dtype=input_dtype).contiguous() if bias is not None else None,
+        B_is_transposed,
+    )
+    if trace:
+        logger.warning(
+            "Sonic multi-stream rank=%s call %d done", local_rank, _MULTISTREAM_CALLS
+        )
+
+    if out is None:
+        if scatter_idx is None:
+            return work_out
+        out = torch.empty_like(work_out)
+    if scatter_idx is not None:
+        out.index_copy_(0, scatter_idx, work_out)
+    elif work_out is not out:
+        out.copy_(work_out)
+    return out
+
+
+def _grouped_gemm_triton(
     A: torch.Tensor,
     B: torch.Tensor,
     cu_seqlens: torch.Tensor,

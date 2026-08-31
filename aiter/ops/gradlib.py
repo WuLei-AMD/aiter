@@ -133,6 +133,54 @@ def hipb_findallsols(
 def getHipblasltKernelName() -> None: ...
 
 
+def gen_hipb_grouped_mm_fake_tensor(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    a_is_transposed: bool = False,
+    bias: Optional[torch.Tensor] = None,
+    solution_index: int = -1,
+) -> torch.Tensor:
+    return out
+
+
+@compile_ops("module_hipb_groupedgemm", gen_fake=gen_hipb_grouped_mm_fake_tensor)
+def hipb_grouped_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    a_is_transposed: bool = False,
+    bias: Optional[torch.Tensor] = None,
+    solution_index: int = -1,
+) -> torch.Tensor: ...
+
+
+def gen_hipb_multistream_mm_fake_tensor(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    a_is_transposed: bool = False,
+    bias: Optional[torch.Tensor] = None,
+    b_is_transposed: bool = False,
+) -> torch.Tensor:
+    return out
+
+
+@compile_ops("module_hipb_groupedgemm", gen_fake=gen_hipb_multistream_mm_fake_tensor)
+def hipb_multistream_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    a_is_transposed: bool = False,
+    bias: Optional[torch.Tensor] = None,
+    b_is_transposed: bool = False,
+) -> torch.Tensor: ...
+
+
 @compile_ops("module_rocsolgemm")
 def rocb_create_extension() -> None: ...
 
