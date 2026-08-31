@@ -190,15 +190,22 @@ def _up_projection_backward_act(
     expert_frequency_offset: torch.Tensor,
     is_glu_activation: bool,
     concat_layout: bool = False,
+    grouped_weight_layout: bool = False,
 ) -> None:
-    I_full, _H, E = w1.size()
+    if grouped_weight_layout:
+        E, H, I_full = w1.size()
+        gemm_w1 = w1
+    else:
+        I_full, H, E = w1.size()
+        gemm_w1 = w1.permute(2, 0, 1)
     I = I_full // 2 if is_glu_activation else I_full
 
     grouped_gemm(
         dh,
-        w1.permute(2, 0, 1),
+        gemm_w1,
         expert_frequency_offset,
         out=dx_expanded,
+        B_is_transposed=grouped_weight_layout,
     )
 
     if db1 is not None:
@@ -230,48 +237,36 @@ def _down_projection_backward_act(
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
     activation_type: str,
+    grouped_weight_layout: bool = False,
+    concat_layout: bool = False,
 ) -> None:
-    H, I, E = w2.size()
+    if grouped_weight_layout:
+        E, I, H = w2.size()
+        gemm_w2 = w2
+    else:
+        H, I, E = w2.size()
+        gemm_w2 = w2.permute(2, 0, 1)
     TK = x_gather_idx.size(0)
     s = topk_scores[s_scatter_idx]
 
-    # 1. Gather dout rows, scale by router scores
-    dout_gathered = dout[x_gather_idx]  # (TK, H)
-    dy = dout_gathered * s.unsqueeze(-1)  # (TK, H)
-
-    # 2. Grouped GEMM: dh_raw = dy @ w2^T per expert -> (TK, I)
-    # w2 is (H, I, E), we need (E, H, I) for B
-    # But we need dy @ w2^T -> dy @ (I, H)^T doesn't work directly.
-    # Actually w2 is (H, I, E), permuted to (E, H, I) for grouped gemm.
-    # We want y = a @ w2_e where w2_e is (H, I, E) -> per expert (H, I)
-    # So backward: da = dy @ w2_e^T = dy @ (I, H) where dy is (TK, H), result is (TK, I)
-    # Grouped gemm: A=(TK, H), B=(E, H, I), C=(TK, I) — this is correct.
-    # w2.permute(2, 0, 1) = (E, H, I) — K=H, N=I
-    dh_raw = torch.empty(TK, I, dtype=dh.dtype, device=dh.device)
-    grouped_gemm(dy, w2.permute(2, 0, 1), expert_frequency_offset, out=dh_raw)
-
-    # 3. ds: dot(dout_gathered, y) where y = a @ w2 per expert
-    # ds_scattered = sum_h(dout_gathered * (a @ w2_e)) but we already have dy = dout_gathered * s
-    # Actually ds = sum_h(dout_gathered[i] * y[i]) for each token
-    # We compute it as: ds = (dy / s) dot y, but simpler: recompute from dout_gathered and y.
-    # From the original: ds = colvec_reduce of (dout_gathered^T @ a_e @ w2_e) but that's complex.
-    # Simpler: compute a_prime = activation(h), then y = a_prime @ w2_e per expert
-    # ds[i] = sum(dout_gathered[i] * y[i])
-    a_prime_val = activation_fwd(h, I, activation_type)
-    a_prime.copy_(a_prime_val)
-
-    # y_recomputed = a_prime @ w2 per expert
-    y_recomputed = torch.empty(TK, H, dtype=dy.dtype, device=dy.device)
+    # Compute u = dout @ w2.T once. The router gradient reuses this GEMM:
+    # dot(dout, a @ w2) == dot(a, dout @ w2.T), while da = score * u.
+    dout_gathered = dout[x_gather_idx]
+    dh_unscaled = torch.empty(TK, I, dtype=dh.dtype, device=dh.device)
     grouped_gemm(
-        a_prime_val, w2.permute(2, 1, 0), expert_frequency_offset, out=y_recomputed
+        dout_gathered,
+        gemm_w2,
+        expert_frequency_offset,
+        out=dh_unscaled,
+        B_is_transposed=grouped_weight_layout,
     )
-    # w2 is (H, I, E), permute(2,1,0) = (E, I, H) — so A=(TK, I), B=(E, I, H) -> C=(TK, H)
 
-    ds_scattered = (dout_gathered * y_recomputed).sum(dim=-1)
+    a_prime_val = activation_fwd(h, I, activation_type, concat_layout)
+    a_prime.copy_(a_prime_val)
+    ds_scattered = (a_prime_val.float() * dh_unscaled.float()).sum(dim=-1)
 
-    # 4. dactivation: dh = dh_raw * d_activation(h)
-    # For swiglu: dh includes both gate and up gradients
-    dh_act = activation_bwd(h, dh_raw, I, activation_type)
+    dh_raw = dh_unscaled * s.unsqueeze(-1)
+    dh_act = activation_bwd(h, dh_raw, I, activation_type, concat_layout)
     dh.copy_(dh_act)
 
     if db2 is None:
