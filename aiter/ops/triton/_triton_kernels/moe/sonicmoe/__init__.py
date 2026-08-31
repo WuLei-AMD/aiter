@@ -102,18 +102,24 @@ class _UpProjection(torch.autograd.Function):
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
         concat_layout: bool = False,
+        grouped_weight_layout: bool = False,
         inputs_are_pre_routed: bool = False,
     ) -> torch.Tensor:
         T, H = x.shape
         E = expert_frequency_offset.numel() - 1
-        grouped_weight_layout = w1.shape[0] == E
         if grouped_weight_layout:
             E_w, H_w, I_full = w1.shape
-            assert E_w == E
+            if E_w != E or H_w != H:
+                raise ValueError(
+                    f"Grouped w1 must be [E={E}, H={H}, I], got {tuple(w1.shape)}"
+                )
             gemm_w1 = w1
         else:
             I_full, H_w, E_w = w1.shape
-            assert E_w == E
+            if E_w != E or H_w != H:
+                raise ValueError(
+                    f"Legacy w1 must be [I, H={H}, E={E}], got {tuple(w1.shape)}"
+                )
             gemm_w1 = w1.permute(2, 1, 0)
         is_glu_activation = is_glu(activation_type)
         I = I_full // 2 if is_glu_activation else I_full
@@ -240,7 +246,7 @@ class _UpProjection(torch.autograd.Function):
                 is_varlen_K=is_each_token_has_variable_activated_experts,
             )
 
-        return dx_reduced, dw1, db1, *[None] * 13
+        return dx_reduced, dw1, db1, *[None] * 14
 
 
 class _DownProjection(torch.autograd.Function):
@@ -261,18 +267,26 @@ class _DownProjection(torch.autograd.Function):
         num_activated_expert_per_token_offset: torch.Tensor,
         is_varlen_K: bool,
         activation_type: ActivationType,
+        grouped_weight_layout: bool,
         concat_layout: bool,
     ) -> torch.Tensor:
         TK = a.size(0)
         E = expert_frequency_offset.numel() - 1
-        grouped_weight_layout = w2.shape[0] == E
         if grouped_weight_layout:
             E_w, I, H = w2.shape
-            assert E_w == E
+            if E_w != E or I != a.size(1):
+                raise ValueError(
+                    f"Grouped w2 must be [E={E}, I={a.size(1)}, H], "
+                    f"got {tuple(w2.shape)}"
+                )
             gemm_w2 = w2
         else:
             H, I, E_w = w2.shape
-            assert E_w == E
+            if E_w != E or I != a.size(1):
+                raise ValueError(
+                    f"Legacy w2 must be [H, I={a.size(1)}, E={E}], "
+                    f"got {tuple(w2.shape)}"
+                )
             gemm_w2 = w2.permute(2, 1, 0)
 
         # Grouped GEMM: y = a @ w2 per expert
@@ -379,7 +393,7 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dh, dw2, db2, ds, *[None] * 10
+        return None, dh, dw2, db2, ds, *[None] * 11
 
 
 def moe_TC_softmax_topk_layer(
@@ -443,6 +457,7 @@ def moe_TC_softmax_topk_layer(
         is_inference_mode_enabled,
         concat_layout,
         False,
+        False,
     )
 
     o = _DownProjection.apply(
@@ -460,6 +475,7 @@ def moe_TC_softmax_topk_layer(
         None,
         False,
         activation_type,
+        False,
         concat_layout,
     )
 
@@ -480,12 +496,12 @@ def moe_general_routing_inputs(
     activation_type: ActivationType,
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
+    grouped_weight_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None))
 
     T = x.size(0)
     TK = router_scores.size(0)
-    E = w2.size(-1)
     device = router_scores.device
 
     if router_scores.dtype != torch.float32:
@@ -528,6 +544,7 @@ def moe_general_routing_inputs(
         activation_type,
         is_inference_mode_enabled,
         concat_layout,
+        grouped_weight_layout,
         False,
     )
 
@@ -546,6 +563,7 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
         True,
         activation_type,
+        grouped_weight_layout,
         concat_layout,
     )
 
@@ -564,6 +582,7 @@ def moe_pre_routed_inputs(
     activation_type: ActivationType,
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
+    grouped_weight_layout: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run SonicMoE on tokens already grouped by local expert.
 
@@ -575,15 +594,7 @@ def moe_pre_routed_inputs(
     del stream_id
 
     T = x.size(0)
-    E = (
-        w2.size(0)
-        if w1.size(0) == w2.size(0) == expert_frequency.numel()
-        else w2.size(-1)
-    )
-    if expert_frequency.numel() != E:
-        raise ValueError(
-            f"Expected {E} local expert counts, got {expert_frequency.numel()}"
-        )
+    E = expert_frequency.numel()
     if router_scores.numel() != T:
         raise ValueError(
             f"Expected one router score per pre-routed token ({T}), "
@@ -594,7 +605,9 @@ def moe_pre_routed_inputs(
 
     host_expert_frequency = None
     if expert_frequency.device.type == "cpu":
-        host_expert_frequency = expert_frequency.to(dtype=torch.int64, copy=False).contiguous()
+        host_expert_frequency = expert_frequency.to(
+            dtype=torch.int64, copy=False
+        ).contiguous()
     expert_frequency = expert_frequency.to(device=x.device, dtype=torch.int32)
     expert_frequency_offset = torch.cat(
         (
@@ -609,9 +622,7 @@ def moe_pre_routed_inputs(
                 host_expert_frequency.cumsum(dim=0, dtype=torch.int64),
             )
         )
-        register_host_cu_seqlens(
-            expert_frequency_offset, host_expert_frequency_offset
-        )
+        register_host_cu_seqlens(expert_frequency_offset, host_expert_frequency_offset)
     else:
         clear_registered_host_cu_seqlens(expert_frequency_offset)
     identity = torch.arange(T, dtype=torch.int32, device=x.device)
@@ -631,6 +642,7 @@ def moe_pre_routed_inputs(
         activation_type,
         is_inference_mode_enabled,
         concat_layout,
+        grouped_weight_layout,
         True,
     )
 
@@ -649,6 +661,7 @@ def moe_pre_routed_inputs(
         None,
         False,
         activation_type,
+        grouped_weight_layout,
         concat_layout,
     )
     return o, expert_frequency

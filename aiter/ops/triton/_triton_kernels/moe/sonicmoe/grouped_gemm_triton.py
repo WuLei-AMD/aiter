@@ -1,5 +1,6 @@
 import logging
 import os
+import weakref
 from collections import OrderedDict
 
 import torch
@@ -17,7 +18,9 @@ logger = logging.getLogger(__name__)
 _LOGGED_BACKENDS: set[str] = set()
 _MULTISTREAM_CALLS = 0
 _HOST_CU_SEQLENS_CACHE_MAX_ENTRIES = 4096
-_HOST_CU_SEQLENS_CACHE: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
+_HOST_CU_SEQLENS_CACHE: OrderedDict[
+    tuple[int, int], tuple[weakref.ReferenceType, torch.Tensor]
+] = OrderedDict()
 
 
 def _cu_seqlens_cache_key(cu_seqlens: torch.Tensor) -> tuple[int, int]:
@@ -43,7 +46,7 @@ def register_host_cu_seqlens(
         device="cpu", dtype=torch.int64, copy=False
     ).contiguous()
     key = _cu_seqlens_cache_key(cu_seqlens)
-    _HOST_CU_SEQLENS_CACHE[key] = host_cu_seqlens
+    _HOST_CU_SEQLENS_CACHE[key] = (weakref.ref(cu_seqlens), host_cu_seqlens)
     _HOST_CU_SEQLENS_CACHE.move_to_end(key)
     while len(_HOST_CU_SEQLENS_CACHE) > _HOST_CU_SEQLENS_CACHE_MAX_ENTRIES:
         _HOST_CU_SEQLENS_CACHE.popitem(last=False)
@@ -55,9 +58,14 @@ def _registered_host_cu_seqlens(
     if cu_seqlens.device.type != "cuda":
         return cu_seqlens
     key = _cu_seqlens_cache_key(cu_seqlens)
-    host_cu_seqlens = _HOST_CU_SEQLENS_CACHE.get(key)
-    if host_cu_seqlens is not None:
-        _HOST_CU_SEQLENS_CACHE.move_to_end(key)
+    entry = _HOST_CU_SEQLENS_CACHE.get(key)
+    if entry is None:
+        return None
+    tensor_ref, host_cu_seqlens = entry
+    if tensor_ref() is not cu_seqlens:
+        _HOST_CU_SEQLENS_CACHE.pop(key, None)
+        return None
+    _HOST_CU_SEQLENS_CACHE.move_to_end(key)
     return host_cu_seqlens
 
 
@@ -463,11 +471,28 @@ def grouped_gemm(
             "SONIC_MOE_GROUPED_GEMM_BACKEND must be triton, hipblaslt, "
             "multistream, or auto"
         )
+    if A_is_transposed:
+        if B_is_transposed:
+            raise ValueError("a grouped wgrad does not support a transposed B")
+        if bias is not None:
+            raise ValueError("bias is invalid for a grouped wgrad")
+        if scatter_idx is not None:
+            raise ValueError("scatter_idx is invalid for a grouped wgrad")
     if backend == "triton":
-        triton_b = B.transpose(1, 2) if B_is_transposed else B
-        return _grouped_gemm_triton(
-            A, triton_b, cu_seqlens, out, bias, A_idx, scatter_idx, A_is_transposed
+        local_out = _local_tensor(out)
+        local_b = _local_tensor(B)
+        triton_b = local_b.transpose(1, 2) if B_is_transposed else local_b
+        result = _grouped_gemm_triton(
+            _local_tensor(A),
+            triton_b,
+            _local_tensor(cu_seqlens),
+            local_out,
+            _local_tensor(bias),
+            _local_tensor(A_idx),
+            _local_tensor(scatter_idx),
+            A_is_transposed,
         )
+        return out if out is not None else result
     if backend == "multistream":
         return _grouped_gemm_multistream(
             A,
@@ -509,17 +534,20 @@ def grouped_gemm(
                 B_is_transposed,
             )
         except (RuntimeError, ValueError):
-            triton_b = B.transpose(1, 2) if B_is_transposed else B
-            return _grouped_gemm_triton(
-                A,
+            local_out = _local_tensor(out)
+            local_b = _local_tensor(B)
+            triton_b = local_b.transpose(1, 2) if B_is_transposed else local_b
+            result = _grouped_gemm_triton(
+                _local_tensor(A),
                 triton_b,
-                cu_seqlens,
-                out,
-                bias,
-                A_idx,
-                scatter_idx,
+                _local_tensor(cu_seqlens),
+                local_out,
+                _local_tensor(bias),
+                _local_tensor(A_idx),
+                _local_tensor(scatter_idx),
                 A_is_transposed,
             )
+            return out if out is not None else result
 
 
 def _grouped_gemm_hipblaslt(
@@ -610,11 +638,7 @@ def _grouped_gemm_multistream(
     work_a = work_a.contiguous()
     work_b = B.contiguous()
     host_cu_seqlens = _registered_host_cu_seqlens(cu_seqlens)
-    counts = (
-        host_cu_seqlens
-        if host_cu_seqlens is not None
-        else cu_seqlens.contiguous()
-    )
+    counts = host_cu_seqlens if host_cu_seqlens is not None else cu_seqlens.contiguous()
     if A_is_transposed:
         if scatter_idx is not None:
             raise ValueError("scatter_idx is invalid for a grouped wgrad")
@@ -638,9 +662,7 @@ def _grouped_gemm_multistream(
         and tuple(out.shape) == shape
     )
     work_out = (
-        out
-        if direct_out
-        else torch.empty(shape, dtype=input_dtype, device=A.device)
+        out if direct_out else torch.empty(shape, dtype=input_dtype, device=A.device)
     )
     _MULTISTREAM_CALLS += 1
     local_rank = os.environ.get("LOCAL_RANK", "0")
@@ -712,7 +734,9 @@ def _grouped_gemm_triton(
         return (max_m_blocks * triton.cdiv(N, META["BLOCK_N"]),)
 
     launch_args = (
-        A, B, out,
+        A,
+        B,
+        out,
         cu_seqlens,
         bias if bias is not None else A,
         A_idx if A_idx is not None else cu_seqlens,
@@ -731,7 +755,6 @@ def _grouped_gemm_triton(
         "N": N,
         "K": K_dim,
         "E": E,
-        "GROUP_SIZE_M": 8,
         "HAS_BIAS": (bias is not None),
         "HAS_GATHER_IDX": (A_idx is not None),
         "HAS_SCATTER_IDX": (scatter_idx is not None),
@@ -739,14 +762,14 @@ def _grouped_gemm_triton(
     fixed = _QWEN3_FWD_CONFIGS.get((N, K_dim, E, A_idx is not None))
     fwd_cfg = get_grouped_gemm_fwd_config(N, K_dim, E)
     if _use_qwen3_tuned_configs() and fixed is not None:
-        _grouped_gemm_kernel[grid](*launch_args, **launch_meta, **fixed)
+        _grouped_gemm_kernel[grid](*launch_args, **launch_meta, GROUP_SIZE_M=8, **fixed)
     elif fwd_cfg is not None:
         constexprs, launch = split_launch_config(fwd_cfg)
-        _grouped_gemm_kernel[grid](
-            *launch_args, **launch_meta, **constexprs, **launch
-        )
+        _grouped_gemm_kernel[grid](*launch_args, **launch_meta, **constexprs, **launch)
     else:
-        _grouped_gemm_kernel_autotuned[grid](*launch_args, **launch_meta)
+        _grouped_gemm_kernel_autotuned[grid](
+            *launch_args, **launch_meta, GROUP_SIZE_M=8
+        )
     return out
 
 
@@ -770,12 +793,18 @@ def _grouped_gemm_dw(
         return (E * num_k_blocks * num_n_blocks,)
 
     launch_args = (
-        A, B, out,
+        A,
+        B,
+        out,
         cu_seqlens,
         A_idx if A_idx is not None else cu_seqlens,
-        A.stride(0), A.stride(1),
-        B.stride(0), B.stride(1),
-        out.stride(0), out.stride(1), out.stride(2),
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
     )
     launch_meta = {
         "N": N,

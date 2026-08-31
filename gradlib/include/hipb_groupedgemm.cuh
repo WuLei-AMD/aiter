@@ -9,7 +9,7 @@
 #include <optional>
 #include <vector>
 
-torch::Tensor hipb_grouped_mm(
+void hipb_grouped_mm(
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& cu_seqlens,
@@ -26,7 +26,7 @@ std::vector<int> hipb_grouped_findallsols(
     bool a_is_transposed = false,
     std::optional<torch::Tensor> bias = std::nullopt);
 
-torch::Tensor hipb_multistream_mm(
+void hipb_multistream_mm(
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& cu_seqlens,

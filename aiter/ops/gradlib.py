@@ -153,11 +153,15 @@ def gen_hipb_grouped_mm_fake_tensor(
     a_is_transposed: bool = False,
     bias: torch.Tensor | None = None,
     solution_index: int = -1,
-) -> torch.Tensor:
-    return out
+) -> None:
+    return None
 
 
-@compile_ops("module_hipb_groupedgemm", gen_fake=gen_hipb_grouped_mm_fake_tensor)
+@compile_ops(
+    "module_hipb_groupedgemm",
+    gen_fake=gen_hipb_grouped_mm_fake_tensor,
+    mutates_args=["out"],
+)
 def hipb_grouped_mm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -166,7 +170,7 @@ def hipb_grouped_mm(
     a_is_transposed: bool = False,
     bias: torch.Tensor | None = None,
     solution_index: int = -1,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 def gen_hipb_multistream_mm_fake_tensor(
@@ -177,11 +181,15 @@ def gen_hipb_multistream_mm_fake_tensor(
     a_is_transposed: bool = False,
     bias: torch.Tensor | None = None,
     b_is_transposed: bool = False,
-) -> torch.Tensor:
-    return out
+) -> None:
+    return None
 
 
-@compile_ops("module_hipb_groupedgemm", gen_fake=gen_hipb_multistream_mm_fake_tensor)
+@compile_ops(
+    "module_hipb_groupedgemm",
+    gen_fake=gen_hipb_multistream_mm_fake_tensor,
+    mutates_args=["out"],
+)
 def hipb_multistream_mm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -190,7 +198,7 @@ def hipb_multistream_mm(
     a_is_transposed: bool = False,
     bias: torch.Tensor | None = None,
     b_is_transposed: bool = False,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_rocsolgemm")
