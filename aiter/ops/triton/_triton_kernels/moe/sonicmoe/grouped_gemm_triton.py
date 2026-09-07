@@ -97,6 +97,14 @@ _QWEN3_FWD_CONFIGS = {
         "num_warps": 4,
         "num_stages": 2,
     },
+    # Pre-routed Sonic expert w1 forward has no gather index.
+    (1536, 2048, 16, False): {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+    },
     (2048, 768, 16, False): {
         "BLOCK_M": 128,
         "BLOCK_N": 128,
@@ -122,6 +130,14 @@ _QWEN3_FWD_CONFIGS = {
 
 _QWEN3_DW_CONFIGS = {
     (1536, 2048, 16, True): {
+        "BLOCK_K": 128,
+        "BLOCK_N": 128,
+        "BLOCK_T": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+    },
+    # Pre-routed Sonic expert w1 wgrad has no gather index.
+    (1536, 2048, 16, False): {
         "BLOCK_K": 128,
         "BLOCK_N": 128,
         "BLOCK_T": 64,
@@ -180,6 +196,8 @@ def _prune_fwd_configs(configs, nargs, **kw):
 def _grouped_gemm_kernel(
     A_ptr,
     B_ptr,
+    A_scale_ptr,
+    B_scale_ptr,
     C_ptr,
     cu_seqlens_ptr,
     bias_ptr,
@@ -190,6 +208,11 @@ def _grouped_gemm_kernel(
     stride_be,
     stride_bk,
     stride_bn,
+    stride_asm,
+    stride_ask,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
     stride_cm,
     stride_cn,
     stride_bias_e,
@@ -197,6 +220,8 @@ def _grouped_gemm_kernel(
     N: tl.constexpr,
     K: tl.constexpr,
     E: tl.constexpr,
+    SCALE_BLOCK_SIZE: tl.constexpr,
+    BLOCKWISE_FP8: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -283,7 +308,24 @@ def _grouped_gemm_kernel(
             mask=k_mask[:, None] & (offs_n[None, :] < N),
             other=0.0,
         ).to(a_dtype)
-        acc += tl.dot(a, b)
+        dot = tl.dot(a, b)
+        if BLOCKWISE_FP8:
+            scale_k = k_start // SCALE_BLOCK_SIZE
+            a_scale = tl.load(
+                A_scale_ptr + a_row_idx * stride_asm + scale_k * stride_ask,
+                mask=m_mask,
+                other=0.0,
+            )
+            b_scale = tl.load(
+                B_scale_ptr
+                + expert_id_i64 * stride_bse
+                + scale_k * stride_bsk
+                + (offs_n // SCALE_BLOCK_SIZE).to(tl.int64) * stride_bsn,
+                mask=offs_n < N,
+                other=0.0,
+            )
+            dot *= a_scale[:, None] * b_scale[None, :]
+        acc += dot
 
     if HAS_BIAS:
         bias_vals = tl.load(
@@ -357,6 +399,8 @@ def _prune_dw_configs(configs, nargs, **kw):
 def _grouped_gemm_dw_kernel(
     A_ptr,
     B_ptr,
+    A_scale_ptr,
+    B_scale_ptr,
     C_ptr,
     cu_seqlens_ptr,
     A_idx_ptr,
@@ -364,12 +408,18 @@ def _grouped_gemm_dw_kernel(
     stride_am,
     stride_bm,
     stride_bn,
+    stride_ast,
+    stride_ask,
+    stride_bst,
+    stride_bsn,
     stride_ce,
     stride_ck,
     stride_cn,
     N: tl.constexpr,
     K: tl.constexpr,
     E: tl.constexpr,
+    SCALE_BLOCK_SIZE: tl.constexpr,
+    BLOCKWISE_FP8: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -388,6 +438,13 @@ def _grouped_gemm_dw_kernel(
     expert_start = tl.load(cu_seqlens_ptr + expert_id).to(tl.int32)
     expert_end = tl.load(cu_seqlens_ptr + expert_id + 1).to(tl.int32)
     M_expert = expert_end - expert_start
+    scale_expert_start = 0
+    if BLOCKWISE_FP8:
+        for e in range(E):
+            if e < expert_id:
+                e_start = tl.load(cu_seqlens_ptr + e).to(tl.int32)
+                e_end = tl.load(cu_seqlens_ptr + e + 1).to(tl.int32)
+                scale_expert_start += tl.cdiv(e_end - e_start, SCALE_BLOCK_SIZE)
 
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -411,9 +468,9 @@ def _grouped_gemm_dw_kernel(
 
         a = tl.load(
             A_ptr
-            + a_row_idx[:, None] * stride_ak
-            + offs_k[None, :].to(tl.int64) * stride_am,
-            mask=t_mask[:, None] & k_mask[None, :],
+            + offs_k[:, None].to(tl.int64) * stride_am
+            + a_row_idx[None, :] * stride_ak,
+            mask=k_mask[:, None] & t_mask[None, :],
             other=0.0,
         ).to(a_dtype)
 
@@ -425,7 +482,27 @@ def _grouped_gemm_dw_kernel(
             other=0.0,
         ).to(a_dtype)
 
-        acc += tl.dot(tl.trans(a), b)
+        # Load A directly as [K, T]. Keeping the reduction dimension contiguous
+        # in the dot operands avoids the very slow FP8 lowering of tl.trans(a).
+        dot = tl.dot(a, b)
+        if BLOCKWISE_FP8:
+            scale_t = scale_expert_start + t_start // SCALE_BLOCK_SIZE
+            a_scale = tl.load(
+                A_scale_ptr
+                + scale_t * stride_ast
+                + offs_k.to(tl.int64) * stride_ask,
+                mask=k_mask,
+                other=0.0,
+            )
+            b_scale = tl.load(
+                B_scale_ptr
+                + scale_t * stride_bst
+                + offs_n.to(tl.int64) * stride_bsn,
+                mask=n_mask,
+                other=0.0,
+            )
+            dot *= a_scale[:, None] * b_scale[None, :]
+        acc += dot
 
     c = acc.to(C_ptr.dtype.element_ty)
     expert_id_i64 = expert_id.to(tl.int64)
@@ -464,8 +541,27 @@ def grouped_gemm(
     scatter_idx: torch.Tensor | None = None,
     A_is_transposed: bool = False,
     B_is_transposed: bool = False,
+    A_scale: torch.Tensor | None = None,
+    B_scale: torch.Tensor | None = None,
+    block_size: int = 128,
+    out_dtype: torch.dtype | None = None,
 ):
-    backend = os.environ.get("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton").lower()
+    """Grouped GEMM. Optional ``A_scale``/``B_scale`` enable blockwise FP8.
+
+    When scales are set, ``A`` is 1×``block_size`` (default 128) activations
+    and ``B`` is 128×128 weight tiles. Used for Qwen3-style expert forward,
+    dgrad (``B_is_transposed``), and wgrad (``A_is_transposed``).
+    """
+    blockwise_fp8 = A_scale is not None or B_scale is not None
+    if blockwise_fp8:
+        if A_scale is None or B_scale is None:
+            raise ValueError("A_scale and B_scale must be provided together")
+        if block_size != 128:
+            raise ValueError("Sonic blockwise FP8 currently requires block_size=128")
+        # The hipBLASLt backends do not accept block scales.
+        backend = "triton"
+    else:
+        backend = os.environ.get("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton").lower()
     if backend not in {"triton", "hipblaslt", "multistream", "auto"}:
         raise ValueError(
             "SONIC_MOE_GROUPED_GEMM_BACKEND must be triton, hipblaslt, "
@@ -482,6 +578,12 @@ def grouped_gemm(
         local_out = _local_tensor(out)
         local_b = _local_tensor(B)
         triton_b = local_b.transpose(1, 2) if B_is_transposed else local_b
+        local_b_scale = _local_tensor(B_scale)
+        triton_b_scale = (
+            local_b_scale.transpose(1, 2)
+            if B_is_transposed and local_b_scale is not None
+            else local_b_scale
+        )
         result = _grouped_gemm_triton(
             _local_tensor(A),
             triton_b,
@@ -491,6 +593,10 @@ def grouped_gemm(
             _local_tensor(A_idx),
             _local_tensor(scatter_idx),
             A_is_transposed,
+            _local_tensor(A_scale),
+            triton_b_scale,
+            block_size,
+            out_dtype,
         )
         return out if out is not None else result
     if backend == "multistream":
@@ -716,9 +822,15 @@ def _grouped_gemm_triton(
     A_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     A_is_transposed: bool = False,
+    A_scale: torch.Tensor | None = None,
+    B_scale: torch.Tensor | None = None,
+    block_size: int = 128,
+    out_dtype: torch.dtype | None = None,
 ):
     if A_is_transposed and B.dim() == 2:
-        return _grouped_gemm_dw(A, B, cu_seqlens, out, A_idx)
+        return _grouped_gemm_dw(
+            A, B, cu_seqlens, out, A_idx, A_scale, B_scale, block_size, out_dtype
+        )
 
     E = B.shape[0]
     K_dim = B.shape[1]
@@ -727,7 +839,31 @@ def _grouped_gemm_triton(
     TK = A.shape[0] if A_idx is None else A_idx.numel()
 
     if out is None:
-        out = torch.empty(TK, N, dtype=A.dtype, device=A.device)
+        out = torch.empty(
+            TK,
+            N,
+            dtype=out_dtype if out_dtype is not None else A.dtype,
+            device=A.device,
+        )
+
+    blockwise_fp8 = A_scale is not None
+    if blockwise_fp8:
+        if B_scale is None:
+            raise ValueError("B_scale is required when A_scale is provided")
+        expected_a_scale = (A.shape[0], triton.cdiv(K_dim, block_size))
+        expected_b_scale = (
+            E,
+            triton.cdiv(K_dim, block_size),
+            triton.cdiv(N, block_size),
+        )
+        if tuple(A_scale.shape) != expected_a_scale:
+            raise ValueError(
+                f"A_scale must have shape {expected_a_scale}, got {tuple(A_scale.shape)}"
+            )
+        if tuple(B_scale.shape) != expected_b_scale:
+            raise ValueError(
+                f"B_scale must have shape {expected_b_scale}, got {tuple(B_scale.shape)}"
+            )
 
     def grid(META):
         max_m_blocks = triton.cdiv(TK, META["BLOCK_M"]) + E - 1
@@ -736,6 +872,8 @@ def _grouped_gemm_triton(
     launch_args = (
         A,
         B,
+        A_scale if A_scale is not None else A,
+        B_scale if B_scale is not None else B,
         out,
         cu_seqlens,
         bias if bias is not None else A,
@@ -746,6 +884,11 @@ def _grouped_gemm_triton(
         B.stride(0),
         B.stride(1),
         B.stride(2),
+        A_scale.stride(0) if A_scale is not None else 0,
+        A_scale.stride(1) if A_scale is not None else 0,
+        B_scale.stride(0) if B_scale is not None else 0,
+        B_scale.stride(1) if B_scale is not None else 0,
+        B_scale.stride(2) if B_scale is not None else 0,
         out.stride(0),
         out.stride(1),
         bias.stride(0) if bias is not None else 0,
@@ -755,6 +898,8 @@ def _grouped_gemm_triton(
         "N": N,
         "K": K_dim,
         "E": E,
+        "SCALE_BLOCK_SIZE": block_size,
+        "BLOCKWISE_FP8": blockwise_fp8,
         "HAS_BIAS": (bias is not None),
         "HAS_GATHER_IDX": (A_idx is not None),
         "HAS_SCATTER_IDX": (scatter_idx is not None),
@@ -779,13 +924,41 @@ def _grouped_gemm_dw(
     cu_seqlens: torch.Tensor,
     out: torch.Tensor | None,
     A_idx: torch.Tensor | None,
+    A_scale: torch.Tensor | None = None,
+    B_scale: torch.Tensor | None = None,
+    block_size: int = 128,
+    out_dtype: torch.dtype | None = None,
 ):
     K_dim = A.shape[1]
     N = B.shape[1]
     E = cu_seqlens.shape[0] - 1
 
     if out is None:
-        out = torch.empty(E, K_dim, N, dtype=A.dtype, device=A.device)
+        out = torch.empty(
+            E,
+            K_dim,
+            N,
+            dtype=out_dtype if out_dtype is not None else A.dtype,
+            device=A.device,
+        )
+
+    blockwise_fp8 = A_scale is not None
+    if blockwise_fp8:
+        if B_scale is None:
+            raise ValueError("B_scale is required when A_scale is provided")
+        min_scale_rows = triton.cdiv(A.shape[0], block_size)
+        if A_scale.dim() != 2 or A_scale.shape[0] < min_scale_rows or A_scale.shape[1] != K_dim:
+            raise ValueError(
+                f"A_scale must have shape [>={min_scale_rows}, {K_dim}], "
+                f"got {tuple(A_scale.shape)}"
+            )
+        if B_scale.dim() != 2 or B_scale.shape[0] < min_scale_rows or B_scale.shape[1] != N:
+            raise ValueError(
+                f"B_scale must have shape [>={min_scale_rows}, {N}], "
+                f"got {tuple(B_scale.shape)}"
+            )
+        if A_idx is not None:
+            raise ValueError("blockwise FP8 grouped wgrad does not support A_idx")
 
     def grid(META):
         num_k_blocks = triton.cdiv(K_dim, META["BLOCK_K"])
@@ -795,6 +968,8 @@ def _grouped_gemm_dw(
     launch_args = (
         A,
         B,
+        A_scale if A_scale is not None else A,
+        B_scale if B_scale is not None else B,
         out,
         cu_seqlens,
         A_idx if A_idx is not None else cu_seqlens,
@@ -802,6 +977,10 @@ def _grouped_gemm_dw(
         A.stride(1),
         B.stride(0),
         B.stride(1),
+        A_scale.stride(0) if A_scale is not None else 0,
+        A_scale.stride(1) if A_scale is not None else 0,
+        B_scale.stride(0) if B_scale is not None else 0,
+        B_scale.stride(1) if B_scale is not None else 0,
         out.stride(0),
         out.stride(1),
         out.stride(2),
@@ -810,6 +989,8 @@ def _grouped_gemm_dw(
         "N": N,
         "K": K_dim,
         "E": E,
+        "SCALE_BLOCK_SIZE": block_size,
+        "BLOCKWISE_FP8": blockwise_fp8,
         "HAS_GATHER_IDX": A_idx is not None,
     }
     fixed = _QWEN3_DW_CONFIGS.get((N, K_dim, E, A_idx is not None))
