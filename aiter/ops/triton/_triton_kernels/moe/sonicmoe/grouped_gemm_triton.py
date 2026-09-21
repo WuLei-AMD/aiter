@@ -376,16 +376,12 @@ def _grouped_gemm_dw_kernel(
         if BLOCKWISE_FP8:
             scale_t = scale_expert_start + t_start // SCALE_BLOCK_SIZE
             a_scale = tl.load(
-                A_scale_ptr
-                + scale_t * stride_ast
-                + offs_k.to(tl.int64) * stride_ask,
+                A_scale_ptr + scale_t * stride_ast + offs_k.to(tl.int64) * stride_ask,
                 mask=k_mask,
                 other=0.0,
             )
             b_scale = tl.load(
-                B_scale_ptr
-                + scale_t * stride_bst
-                + offs_n.to(tl.int64) * stride_bsn,
+                B_scale_ptr + scale_t * stride_bst + offs_n.to(tl.int64) * stride_bsn,
                 mask=n_mask,
                 other=0.0,
             )
@@ -817,12 +813,20 @@ def _grouped_gemm_dw(
         if B_scale is None:
             raise ValueError("B_scale is required when A_scale is provided")
         min_scale_rows = triton.cdiv(A.shape[0], block_size)
-        if A_scale.dim() != 2 or A_scale.shape[0] < min_scale_rows or A_scale.shape[1] != K_dim:
+        if (
+            A_scale.dim() != 2
+            or A_scale.shape[0] < min_scale_rows
+            or A_scale.shape[1] != K_dim
+        ):
             raise ValueError(
                 f"A_scale must have shape [>={min_scale_rows}, {K_dim}], "
                 f"got {tuple(A_scale.shape)}"
             )
-        if B_scale.dim() != 2 or B_scale.shape[0] < min_scale_rows or B_scale.shape[1] != N:
+        if (
+            B_scale.dim() != 2
+            or B_scale.shape[0] < min_scale_rows
+            or B_scale.shape[1] != N
+        ):
             raise ValueError(
                 f"B_scale must have shape [>={min_scale_rows}, {N}], "
                 f"got {tuple(B_scale.shape)}"
@@ -867,7 +871,5 @@ def _grouped_gemm_dw(
         N, K_dim, E, A_idx is not None, _use_qwen3_tuned_configs()
     )
     constexprs, launch = split_launch_config(dw_cfg)
-    _grouped_gemm_dw_kernel[grid](
-        *launch_args, **launch_meta, **constexprs, **launch
-    )
+    _grouped_gemm_dw_kernel[grid](*launch_args, **launch_meta, **constexprs, **launch)
     return out

@@ -17,12 +17,11 @@ from aiter.ops.triton._triton_kernels.moe.sonicmoe.routing import (
 )
 from aiter.ops.triton.sonicmoe import (
     SonicMoEActivationType,
-    moe_TC_softmax_topk_layer,
     moe_pre_routed_inputs,
+    moe_TC_softmax_topk_layer,
     sonicmoe_is_glu,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 
@@ -120,13 +119,19 @@ def test_sonicmoe_pre_routed_forward_backward(activation):
     counts = [5, 0, 7]
     tokens, experts, hidden, intermediate = sum(counts), len(counts), 32, 16
     full_intermediate = intermediate * (2 if sonicmoe_is_glu(activation) else 1)
-    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16).requires_grad_()
-    scores = torch.rand(tokens, device="cuda", dtype=torch.float32).requires_grad_()
-    w1 = torch.randn(
-        experts, hidden, full_intermediate, device="cuda", dtype=torch.bfloat16
+    x = (
+        torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
     ).requires_grad_()
-    w2 = torch.randn(
-        experts, intermediate, hidden, device="cuda", dtype=torch.bfloat16
+    scores = torch.rand(tokens, device="cuda", dtype=torch.float32).requires_grad_()
+    w1 = (
+        torch.randn(
+            experts, hidden, full_intermediate, device="cuda", dtype=torch.bfloat16
+        )
+        * 0.02
+    ).requires_grad_()
+    w2 = (
+        torch.randn(experts, intermediate, hidden, device="cuda", dtype=torch.bfloat16)
+        * 0.02
     ).requires_grad_()
 
     out, _ = moe_pre_routed_inputs(
@@ -150,10 +155,12 @@ def test_sonicmoe_pre_routed_forward_backward(activation):
                 * scores[offset : offset + count, None]
             )
         offset += count
-    ref = torch.cat(ref_chunks)
+    ref = torch.cat(ref_chunks).to(out.dtype)
     torch.testing.assert_close(out, ref, rtol=5e-2, atol=5e-2)
     grad = torch.randn_like(out)
-    actual_grads = torch.autograd.grad(out, (x, scores, w1, w2), grad, retain_graph=True)
+    actual_grads = torch.autograd.grad(
+        out, (x, scores, w1, w2), grad, retain_graph=True
+    )
     ref_grads = torch.autograd.grad(ref, (x, scores, w1, w2), grad)
     for actual, expected in zip(actual_grads, ref_grads):
         torch.testing.assert_close(actual, expected, rtol=7e-2, atol=7e-2)
@@ -184,7 +191,7 @@ def test_topk_routing_metadata_matches_torch():
         torch.cat(
             (
                 torch.zeros(1, dtype=torch.int32, device="cuda"),
-                expected_freq.cumsum(0),
+                expected_freq.cumsum(0).to(torch.int32),
             )
         ),
     )
@@ -281,6 +288,4 @@ def test_grouped_gemm_blockwise_fp8_matches_dequantized_torch():
             for expert in range(experts)
         ]
     )
-    torch.testing.assert_close(
-        actual.float(), expected, rtol=6e-2, atol=1.0
-    )
+    torch.testing.assert_close(actual.float(), expected, rtol=6e-2, atol=1.0)

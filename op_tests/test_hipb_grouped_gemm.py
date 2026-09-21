@@ -13,7 +13,6 @@ from aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton import (
     register_host_cu_seqlens,
 )
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 
 

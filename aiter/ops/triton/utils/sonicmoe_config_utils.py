@@ -14,7 +14,13 @@ _LAUNCH_META = frozenset({"num_warps", "num_stages"})
 
 def load_sonicmoe_configs() -> dict[str, Any]:
     cfg_dir = resolve_config_dir("moe", "SONICMOE-BF16", backend="triton")
-    return load_config_json(f"{cfg_dir}/DEFAULT.json")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+    if config is None:
+        fallback_dir = resolve_config_dir(
+            "moe", "SONICMOE-BF16", backend="triton", arch="gfx942"
+        )
+        config = load_config_json(f"{fallback_dir}/DEFAULT.json")
+    return config
 
 
 def _clean_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
@@ -73,7 +79,9 @@ def get_grouped_gemm_fwd_config(
         if use_specialized
         else None
     )
-    return _clean_bucket(specialized) if specialized else _pick_nk_bucket(section, N, K, E)
+    return (
+        _clean_bucket(specialized) if specialized else _pick_nk_bucket(section, N, K, E)
+    )
 
 
 def get_grouped_gemm_dw_config(
@@ -90,7 +98,9 @@ def get_grouped_gemm_dw_config(
         if use_specialized
         else None
     )
-    return _clean_bucket(specialized) if specialized else _pick_nk_bucket(section, N, K, E)
+    return (
+        _clean_bucket(specialized) if specialized else _pick_nk_bucket(section, N, K, E)
+    )
 
 
 def get_token_gather_config(H: int) -> dict[str, Any]:

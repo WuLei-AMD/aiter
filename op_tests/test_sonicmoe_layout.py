@@ -9,7 +9,6 @@ from aiter.ops.triton.sonicmoe import (
     moe_general_routing_inputs,
 )
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 
 
@@ -51,28 +50,21 @@ def test_general_routing_grouped_weights_match_legacy_layout(with_bias):
     w1_legacy = w1_grouped.detach().permute(2, 1, 0).contiguous().requires_grad_(True)
     w2_legacy = w2_grouped.detach().permute(2, 1, 0).contiguous().requires_grad_(True)
     b1_grouped = (
-        torch.randn(experts, 2 * intermediate, dtype=torch.bfloat16, device=device)
-        .requires_grad_(True)
+        torch.randn(
+            experts, 2 * intermediate, dtype=torch.bfloat16, device=device
+        ).requires_grad_(True)
         if with_bias
         else None
     )
     b2_grouped = (
-        torch.randn(experts, hidden, dtype=torch.bfloat16, device=device).requires_grad_(
-            True
-        )
+        torch.randn(
+            experts, hidden, dtype=torch.bfloat16, device=device
+        ).requires_grad_(True)
         if with_bias
         else None
     )
-    b1_legacy = (
-        b1_grouped.detach().clone().requires_grad_(True)
-        if with_bias
-        else None
-    )
-    b2_legacy = (
-        b2_grouped.detach().clone().requires_grad_(True)
-        if with_bias
-        else None
-    )
+    b1_legacy = b1_grouped.detach().clone().requires_grad_(True) if with_bias else None
+    b2_legacy = b2_grouped.detach().clone().requires_grad_(True) if with_bias else None
 
     common = (
         token_indices,

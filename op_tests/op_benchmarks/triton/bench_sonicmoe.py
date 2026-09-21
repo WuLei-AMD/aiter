@@ -13,7 +13,6 @@ from aiter.ops.triton.sonicmoe import (
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
-
 # tokens, hidden, intermediate, experts, top-k, label
 _SHAPES = [
     (1024, 2048, 768, 16, 2, "Qwen3-small"),
@@ -53,9 +52,7 @@ def benchmark(args):
 
     @triton.testing.perf_report([config])
     def _run(tokens, hidden, intermediate, experts, top_k, label, provider):
-        x, router, w1, w2, grad = _setup(
-            tokens, hidden, intermediate, experts, top_k
-        )
+        x, router, w1, w2, grad = _setup(tokens, hidden, intermediate, experts, top_k)
 
         def forward():
             return moe_TC_softmax_topk_layer(

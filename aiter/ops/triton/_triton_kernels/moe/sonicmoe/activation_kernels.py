@@ -31,6 +31,7 @@ _pointwise_act_bwd_repr = make_kernel_repr(
     "sonicmoe_pointwise_act_bwd", ["I", "BLOCK_M", "BLOCK_I", "ACT_TYPE"]
 )
 
+
 @triton.jit(repr=_glu_fwd_repr)
 def _glu_fwd_kernel(
     h_ptr,

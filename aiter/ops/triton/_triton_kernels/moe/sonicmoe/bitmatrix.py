@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.moe.moe_routing.utils import keyed_add
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _bitmatrix_stage1_repr = make_kernel_repr(
@@ -99,7 +100,7 @@ def _bitmatrix_metadata_compute_stage2(
     mask = expert != 0xFFFF  # exclude padding/OOB slots
 
     scan_input = (kv_pairs & 0xFFFF0000) | 0x00000001
-    inclusive_run_lengths = tl.associative_scan(scan_input, 0, _keyed_add)
+    inclusive_run_lengths = tl.associative_scan(scan_input, 0, keyed_add)
     within_expert_rank = (
         inclusive_run_lengths - 1
     ) & 0xFFFF  # exclusive = inclusive - 1

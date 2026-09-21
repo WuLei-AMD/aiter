@@ -1,13 +1,8 @@
 import torch
 import torch.nn.functional as F
 
-from .grouped_gemm_triton import (
-    _local_tensor,
-    clear_registered_host_cu_seqlens,
-    grouped_gemm,
-    register_host_cu_seqlens,
-)
-from .activation_kernels import activation_fwd, activation_bwd
+from .activation_kernels import activation_bwd as activation_bwd
+from .activation_kernels import activation_fwd
 from .backward import (
     _down_projection_backward_act,
     _token_broadcast_backward,
@@ -15,6 +10,12 @@ from .backward import (
 )
 from .enums import ActivationType, is_glu
 from .forward import _router_forward, _topk_softmax_bwd, _topk_softmax_fwd
+from .grouped_gemm_triton import (
+    _local_tensor,
+    clear_registered_host_cu_seqlens,
+    grouped_gemm,
+    register_host_cu_seqlens,
+)
 from .routing import (
     TC_topk_router_metadata_triton,
     general_routing_router_metadata_triton,
@@ -572,7 +573,6 @@ def moe_pre_routed_inputs(
     del stream_id
 
     T = x.size(0)
-    E = expert_frequency.numel()
     if router_scores.numel() != T:
         raise ValueError(
             f"Expected one router score per pre-routed token ({T}), "

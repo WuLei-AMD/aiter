@@ -159,10 +159,10 @@ def _up_projection_backward_act(
     grouped_weight_layout: bool = False,
 ) -> None:
     if grouped_weight_layout:
-        E, H, I_full = w1.size()
+        E, _, I_full = w1.size()
         gemm_w1 = w1
     else:
-        I_full, H, E = w1.size()
+        I_full, _, E = w1.size()
         gemm_w1 = w1.permute(2, 0, 1)
     I = I_full // 2 if is_glu_activation else I_full
 
