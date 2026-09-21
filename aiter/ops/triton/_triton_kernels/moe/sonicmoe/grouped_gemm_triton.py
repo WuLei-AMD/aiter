@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+import weakref
+from collections import OrderedDict
 
 import torch
 import triton
@@ -45,6 +47,58 @@ _grouped_gemm_dw_repr = make_kernel_repr(
         "HAS_GATHER_IDX",
     ],
 )
+
+
+_HOST_CU_SEQLENS_CACHE_MAX_ENTRIES = 4096
+_HOST_CU_SEQLENS_CACHE: OrderedDict[
+    tuple[int, int], tuple[weakref.ReferenceType, torch.Tensor]
+] = OrderedDict()
+
+
+def _cu_seqlens_cache_key(cu_seqlens: torch.Tensor) -> tuple[int, int]:
+    device_index = cu_seqlens.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return device_index, cu_seqlens.data_ptr()
+
+
+def register_host_cu_seqlens(
+    cu_seqlens: torch.Tensor, host_cu_seqlens: torch.Tensor
+) -> None:
+    """Cache host offsets to avoid GPU-to-CPU syncs in the multi-stream backend."""
+    if cu_seqlens.device.type != "cuda":
+        raise ValueError("cu_seqlens cache keys must be GPU tensors")
+    host_cu_seqlens = host_cu_seqlens.to(
+        device="cpu", dtype=torch.int64, copy=False
+    ).contiguous()
+    key = _cu_seqlens_cache_key(cu_seqlens)
+    _HOST_CU_SEQLENS_CACHE[key] = (weakref.ref(cu_seqlens), host_cu_seqlens)
+    _HOST_CU_SEQLENS_CACHE.move_to_end(key)
+    while len(_HOST_CU_SEQLENS_CACHE) > _HOST_CU_SEQLENS_CACHE_MAX_ENTRIES:
+        _HOST_CU_SEQLENS_CACHE.popitem(last=False)
+
+
+def _registered_host_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor | None:
+    if cu_seqlens.device.type != "cuda":
+        return cu_seqlens
+    key = _cu_seqlens_cache_key(cu_seqlens)
+    entry = _HOST_CU_SEQLENS_CACHE.get(key)
+    if entry is None:
+        return None
+    tensor_ref, host_cu_seqlens = entry
+    if tensor_ref() is not cu_seqlens:
+        _HOST_CU_SEQLENS_CACHE.pop(key, None)
+        return None
+    _HOST_CU_SEQLENS_CACHE.move_to_end(key)
+    return host_cu_seqlens
+
+
+def clear_registered_host_cu_seqlens(cu_seqlens: torch.Tensor) -> None:
+    """Discard a stale host-offset entry for a newly allocated GPU tensor."""
+    if cu_seqlens.device.type == "cuda":
+        _HOST_CU_SEQLENS_CACHE.pop(_cu_seqlens_cache_key(cu_seqlens), None)
 
 
 def _local_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
@@ -353,6 +407,21 @@ def grouped_gemm(
     out_dtype: torch.dtype | None = None,
 ):
     """Run grouped GEMM, optionally with 1x128 activation and 128x128 weight scales."""
+    blockwise_fp8 = A_scale is not None or B_scale is not None
+    if blockwise_fp8:
+        if A_scale is None or B_scale is None:
+            raise ValueError("A_scale and B_scale must be provided together")
+        if block_size != 128:
+            raise ValueError("Sonic blockwise FP8 currently requires block_size=128")
+        # The hipBLASLt backends do not accept block scales.
+        backend = "triton"
+    else:
+        backend = os.environ.get("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton").lower()
+    if backend not in {"triton", "hipblaslt", "multistream", "auto"}:
+        raise ValueError(
+            "SONIC_MOE_GROUPED_GEMM_BACKEND must be triton, hipblaslt, "
+            "multistream, or auto"
+        )
     if A_is_transposed:
         if B_is_transposed:
             raise ValueError("a grouped wgrad does not support a transposed B")
@@ -360,6 +429,34 @@ def grouped_gemm(
             raise ValueError("bias is invalid for a grouped wgrad")
         if scatter_idx is not None:
             raise ValueError("scatter_idx is invalid for a grouped wgrad")
+    if backend == "multistream":
+        return _grouped_gemm_multistream(
+            A,
+            B,
+            cu_seqlens,
+            out,
+            bias,
+            A_idx,
+            scatter_idx,
+            A_is_transposed,
+            B_is_transposed,
+        )
+    if backend in {"hipblaslt", "auto"}:
+        try:
+            return _grouped_gemm_hipblaslt(
+                A,
+                B,
+                cu_seqlens,
+                out,
+                bias,
+                A_idx,
+                scatter_idx,
+                A_is_transposed,
+                B_is_transposed,
+            )
+        except (RuntimeError, ValueError):
+            if backend == "hipblaslt":
+                raise
 
     local_out = _local_tensor(out)
     local_b = _local_tensor(B)
@@ -385,6 +482,138 @@ def grouped_gemm(
         out_dtype,
     )
     return out if out is not None else result
+
+
+def _grouped_gemm_hipblaslt(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    A_idx: torch.Tensor | None,
+    scatter_idx: torch.Tensor | None,
+    A_is_transposed: bool,
+    B_is_transposed: bool,
+):
+    from aiter.ops.gradlib import hipb_grouped_mm
+
+    A = _local_tensor(A)
+    B = _local_tensor(B)
+    bias = _local_tensor(bias)
+    out = _local_tensor(out)
+    work_a = A.index_select(0, A_idx) if A_idx is not None else A
+    work_a = work_a.contiguous()
+    work_b = (
+        B.contiguous()
+        if A_is_transposed or B_is_transposed
+        else B.transpose(1, 2).contiguous()
+    )
+    counts = cu_seqlens.contiguous()
+
+    if A_is_transposed:
+        if scatter_idx is not None:
+            raise ValueError("scatter_idx is invalid for a grouped wgrad")
+        E = counts.numel() - 1
+        shape = (E, work_a.shape[1], work_b.shape[1])
+    else:
+        shape = (work_a.shape[0], work_b.shape[1])
+
+    direct_out = (
+        out is not None
+        and out.is_contiguous()
+        and scatter_idx is None
+        and tuple(out.shape) == shape
+    )
+    work_out = out if direct_out else torch.empty(shape, dtype=A.dtype, device=A.device)
+    if A_is_transposed:
+        work_out.zero_()
+
+    hipb_grouped_mm(
+        work_a,
+        work_b,
+        counts,
+        work_out,
+        A_is_transposed,
+        bias.contiguous() if bias is not None else None,
+    )
+
+    if out is None:
+        if scatter_idx is None:
+            return work_out
+        out = torch.empty_like(work_out)
+    if scatter_idx is not None:
+        out.index_copy_(0, scatter_idx, work_out)
+    elif work_out is not out:
+        out.copy_(work_out)
+    return out
+
+
+def _grouped_gemm_multistream(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    A_idx: torch.Tensor | None,
+    scatter_idx: torch.Tensor | None,
+    A_is_transposed: bool,
+    B_is_transposed: bool,
+):
+    from aiter.ops.gradlib import hipb_multistream_mm
+
+    A = _local_tensor(A)
+    B = _local_tensor(B)
+    bias = _local_tensor(bias)
+    out = _local_tensor(out)
+    work_a = A.index_select(0, A_idx) if A_idx is not None else A
+    work_a = work_a.contiguous()
+    work_b = B.contiguous()
+    host_cu_seqlens = _registered_host_cu_seqlens(cu_seqlens)
+    counts = host_cu_seqlens if host_cu_seqlens is not None else cu_seqlens.contiguous()
+    if A_is_transposed:
+        if scatter_idx is not None:
+            raise ValueError("scatter_idx is invalid for a grouped wgrad")
+        shape = (counts.numel() - 1, work_a.shape[1], work_b.shape[1])
+    else:
+        shape = (
+            work_a.shape[0],
+            work_b.shape[1] if B_is_transposed else work_b.shape[2],
+        )
+
+    input_dtype = torch.promote_types(work_a.dtype, work_b.dtype)
+    if A_is_transposed and out is not None:
+        input_dtype = torch.promote_types(input_dtype, out.dtype)
+    work_a = work_a.to(dtype=input_dtype)
+    work_b = work_b.to(dtype=input_dtype)
+    direct_out = (
+        out is not None
+        and out.is_contiguous()
+        and out.dtype == input_dtype
+        and scatter_idx is None
+        and tuple(out.shape) == shape
+    )
+    work_out = (
+        out if direct_out else torch.empty(shape, dtype=input_dtype, device=A.device)
+    )
+    hipb_multistream_mm(
+        work_a,
+        work_b,
+        counts,
+        work_out,
+        A_is_transposed,
+        bias.to(dtype=input_dtype).contiguous() if bias is not None else None,
+        B_is_transposed,
+    )
+
+    if out is None:
+        if scatter_idx is None:
+            return work_out
+        out = torch.empty_like(work_out)
+    if scatter_idx is not None:
+        out.index_copy_(0, scatter_idx, work_out)
+    elif work_out is not out:
+        out.copy_(work_out)
+    return out
 
 
 def _grouped_gemm_triton(

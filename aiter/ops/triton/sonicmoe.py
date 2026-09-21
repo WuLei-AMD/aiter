@@ -23,7 +23,9 @@ from aiter.ops.triton._triton_kernels.moe.sonicmoe.forward import (
 )
 from aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton import (
     _local_tensor,
+    clear_registered_host_cu_seqlens,
     grouped_gemm,
+    register_host_cu_seqlens,
 )
 from aiter.ops.triton._triton_kernels.moe.sonicmoe.routing import (
     TC_topk_router_metadata_triton,
@@ -591,6 +593,11 @@ def moe_pre_routed_inputs(
     if router_scores.dtype != torch.float32:
         router_scores = router_scores.float()
 
+    host_expert_frequency = None
+    if expert_frequency.device.type == "cpu":
+        host_expert_frequency = expert_frequency.to(
+            dtype=torch.int64, copy=False
+        ).contiguous()
     expert_frequency = expert_frequency.to(device=x.device, dtype=torch.int32)
     expert_frequency_offset = torch.cat(
         (
@@ -598,6 +605,16 @@ def moe_pre_routed_inputs(
             expert_frequency.cumsum(dim=0, dtype=torch.int32),
         )
     )
+    if host_expert_frequency is not None:
+        host_expert_frequency_offset = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int64, device="cpu"),
+                host_expert_frequency.cumsum(dim=0, dtype=torch.int64),
+            )
+        )
+        register_host_cu_seqlens(expert_frequency_offset, host_expert_frequency_offset)
+    else:
+        clear_registered_host_cu_seqlens(expert_frequency_offset)
     identity = torch.arange(T, dtype=torch.int32, device=x.device)
 
     a, h = _UpProjection.apply(
