@@ -173,8 +173,7 @@
   },
   "topk_routing": {
     "ENTRIES_PER_TILE": 1024,
-    "PREFIX_BLOCK_M": 128,
-    "TOKEN_SEARCH_BLOCK": 1024
+    "PREFIX_BLOCK_M": 128
   },
   "general_routing": {
     "BLOCK_SIZE": 1024,

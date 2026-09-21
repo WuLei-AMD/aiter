@@ -768,29 +768,6 @@ void hipb_grouped_mm(const torch::Tensor& a,
                 hipblasStatusToString(status));
 }
 
-std::vector<int> hipb_grouped_findallsols(const torch::Tensor& a,
-                                          const torch::Tensor& b,
-                                          const torch::Tensor& cu_seqlens,
-                                          torch::Tensor out,
-                                          bool a_is_transposed,
-                                          std::optional<torch::Tensor> bias)
-{
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(at::device_of(a));
-    auto problem = make_problem(a, b, cu_seqlens, out, a_is_transposed, bias);
-    if(problem.m.empty())
-        return {};
-    auto& ctx    = get_context(a.get_device());
-    ctx.wait_for_completion();
-    auto grouped = make_grouped_gemm(ctx.handle, problem, a_is_transposed);
-    auto results =
-        supported_algorithms(ctx.handle, *grouped, a_is_transposed, problem.dtype, 256);
-    std::vector<int> indices;
-    indices.reserve(results.size());
-    for(auto& result : results)
-        indices.push_back(hipblaslt_ext::getIndexFromAlgo(result.algo));
-    return indices;
-}
-
 void hipb_multistream_mm(const torch::Tensor& a,
                          const torch::Tensor& b,
                          const torch::Tensor& cu_seqlens,
@@ -1005,15 +982,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
                py::arg("a_is_transposed") = false,
                py::arg("bias")             = std::nullopt,
                py::arg("solution_index")   = -1);
-    module.def("hipb_grouped_findallsols",
-               &hipb_grouped_findallsols,
-               "Find hipBLASLt grouped GEMM solutions",
-               py::arg("a"),
-               py::arg("b"),
-               py::arg("cu_seqlens"),
-               py::arg("out"),
-               py::arg("a_is_transposed") = false,
-               py::arg("bias")             = std::nullopt);
     module.def("hipb_multistream_mm",
                &hipb_multistream_mm,
                "multi-stream BLAS GEMM",

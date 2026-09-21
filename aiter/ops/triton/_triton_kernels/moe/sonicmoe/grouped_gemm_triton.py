@@ -400,14 +400,6 @@ def _grouped_gemm_dw_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-def _compute_grid_fwd(cu_seqlens_cpu, N, E, BLOCK_M, BLOCK_N):
-    total_blocks = 0
-    for e in range(E):
-        m_e = cu_seqlens_cpu[e + 1].item() - cu_seqlens_cpu[e].item()
-        total_blocks += triton.cdiv(m_e, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    return total_blocks
-
-
 def grouped_gemm(
     A: torch.Tensor,
     B: torch.Tensor,

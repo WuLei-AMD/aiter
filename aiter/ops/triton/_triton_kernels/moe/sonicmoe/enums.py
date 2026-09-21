@@ -5,13 +5,6 @@
 from enum import Enum
 
 LIBRARY_NAME = "aiter_sonicmoe"
-TENSORMAP = "tensormap"
-
-
-class KernelBackendMoE(Enum):
-    scattermoe = "scattermoe"
-    torch = "torch"
-    sonicmoe = "sonicmoe"
 
 
 class ActivationType(Enum):

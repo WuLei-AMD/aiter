@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 
-from .activation_kernels import activation_bwd as activation_bwd
 from .activation_kernels import activation_fwd
 from .backward import (
     _down_projection_backward_act,
@@ -212,11 +211,7 @@ class _UpProjection(torch.autograd.Function):
         # Compute dW1 as grouped x.T @ dh.
         grouped_gemm(
             x,
-            (
-                dh.unsqueeze(0).expand(E, -1, -1).contiguous().reshape(E, TK, -1)
-                if False
-                else dh
-            ),
+            dh,
             expert_frequency_offset,
             out=dw1 if ctx.grouped_weight_layout else dw1.permute(2, 1, 0),
             A_idx=None if ctx.inputs_are_pre_routed else x_gather_idx,
@@ -396,6 +391,7 @@ def moe_TC_softmax_topk_layer(
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del stream_id
     assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None))
     E = router_w.size(0)
     router_logits = F.linear(x, router_w)
@@ -483,6 +479,7 @@ def moe_general_routing_inputs(
     concat_layout: bool = False,
     grouped_weight_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    del stream_id
     assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None))
 
     T = x.size(0)

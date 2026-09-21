@@ -6,8 +6,8 @@
 
 from aiter.ops.triton._triton_kernels.moe.sonicmoe import (
     moe_general_routing_inputs,
-    moe_TC_softmax_topk_layer,
     moe_pre_routed_inputs,
+    moe_TC_softmax_topk_layer,
 )
 from aiter.ops.triton._triton_kernels.moe.sonicmoe.enums import (
     ActivationType as SonicMoEActivationType,
