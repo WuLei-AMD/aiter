@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import logging
 import os
 import weakref
 from collections import OrderedDict
@@ -50,9 +49,6 @@ _grouped_gemm_dw_repr = make_kernel_repr(
 )
 
 
-logger = logging.getLogger(__name__)
-_LOGGED_BACKENDS: set[str] = set()
-_MULTISTREAM_CALLS = 0
 _HOST_CU_SEQLENS_CACHE_MAX_ENTRIES = 4096
 _HOST_CU_SEQLENS_CACHE: OrderedDict[
     tuple[int, int], tuple[weakref.ReferenceType, torch.Tensor]
@@ -103,14 +99,6 @@ def clear_registered_host_cu_seqlens(cu_seqlens: torch.Tensor) -> None:
     """Discard a stale host-offset entry for a newly allocated GPU tensor."""
     if cu_seqlens.device.type == "cuda":
         _HOST_CU_SEQLENS_CACHE.pop(_cu_seqlens_cache_key(cu_seqlens), None)
-
-
-def _log_backend_once(backend: str) -> None:
-    if os.environ.get("SONIC_MOE_LOG_BACKEND", "0") != "1":
-        return
-    if backend not in _LOGGED_BACKENDS:
-        logger.warning("Sonic grouped GEMM active backend: %s", backend)
-        _LOGGED_BACKENDS.add(backend)
 
 
 def _local_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
@@ -441,31 +429,6 @@ def grouped_gemm(
             raise ValueError("bias is invalid for a grouped wgrad")
         if scatter_idx is not None:
             raise ValueError("scatter_idx is invalid for a grouped wgrad")
-    if backend == "triton":
-        local_out = _local_tensor(out)
-        local_b = _local_tensor(B)
-        triton_b = local_b.transpose(1, 2) if B_is_transposed else local_b
-        local_b_scale = _local_tensor(B_scale)
-        triton_b_scale = (
-            local_b_scale.transpose(1, 2)
-            if B_is_transposed and local_b_scale is not None
-            else local_b_scale
-        )
-        result = _grouped_gemm_triton(
-            _local_tensor(A),
-            triton_b,
-            _local_tensor(cu_seqlens),
-            local_out,
-            _local_tensor(bias),
-            _local_tensor(A_idx),
-            _local_tensor(scatter_idx),
-            A_is_transposed,
-            _local_tensor(A_scale),
-            triton_b_scale,
-            block_size,
-            out_dtype,
-        )
-        return out if out is not None else result
     if backend == "multistream":
         return _grouped_gemm_multistream(
             A,
@@ -478,24 +441,9 @@ def grouped_gemm(
             A_is_transposed,
             B_is_transposed,
         )
-
-    try:
-        return _grouped_gemm_hipblaslt(
-            A,
-            B,
-            cu_seqlens,
-            out,
-            bias,
-            A_idx,
-            scatter_idx,
-            A_is_transposed,
-            B_is_transposed,
-        )
-    except (RuntimeError, ValueError):
-        if backend == "hipblaslt":
-            raise
+    if backend in {"hipblaslt", "auto"}:
         try:
-            return _grouped_gemm_multistream(
+            return _grouped_gemm_hipblaslt(
                 A,
                 B,
                 cu_seqlens,
@@ -507,20 +455,33 @@ def grouped_gemm(
                 B_is_transposed,
             )
         except (RuntimeError, ValueError):
-            local_out = _local_tensor(out)
-            local_b = _local_tensor(B)
-            triton_b = local_b.transpose(1, 2) if B_is_transposed else local_b
-            result = _grouped_gemm_triton(
-                _local_tensor(A),
-                triton_b,
-                _local_tensor(cu_seqlens),
-                local_out,
-                _local_tensor(bias),
-                _local_tensor(A_idx),
-                _local_tensor(scatter_idx),
-                A_is_transposed,
-            )
-            return out if out is not None else result
+            if backend == "hipblaslt":
+                raise
+
+    local_out = _local_tensor(out)
+    local_b = _local_tensor(B)
+    triton_b = local_b.transpose(1, 2) if B_is_transposed else local_b
+    local_b_scale = _local_tensor(B_scale)
+    triton_b_scale = (
+        local_b_scale.transpose(1, 2)
+        if B_is_transposed and local_b_scale is not None
+        else local_b_scale
+    )
+    result = _grouped_gemm_triton(
+        _local_tensor(A),
+        triton_b,
+        _local_tensor(cu_seqlens),
+        local_out,
+        _local_tensor(bias),
+        _local_tensor(A_idx),
+        _local_tensor(scatter_idx),
+        A_is_transposed,
+        _local_tensor(A_scale),
+        triton_b_scale,
+        block_size,
+        out_dtype,
+    )
+    return out if out is not None else result
 
 
 def _grouped_gemm_hipblaslt(
@@ -598,11 +559,8 @@ def _grouped_gemm_multistream(
     A_is_transposed: bool,
     B_is_transposed: bool,
 ):
-    global _MULTISTREAM_CALLS
-
     from aiter.ops.gradlib import hipb_multistream_mm
 
-    _log_backend_once("hipblaslt_multistream")
     A = _local_tensor(A)
     B = _local_tensor(B)
     bias = _local_tensor(bias)
@@ -637,24 +595,6 @@ def _grouped_gemm_multistream(
     work_out = (
         out if direct_out else torch.empty(shape, dtype=input_dtype, device=A.device)
     )
-    _MULTISTREAM_CALLS += 1
-    local_rank = os.environ.get("LOCAL_RANK", "0")
-    trace = os.environ.get("SONIC_MOE_TRACE_GEMM", "0") == "1" and (
-        local_rank == "0" or os.environ.get("SONIC_MOE_TRACE_ALL_RANKS", "0") == "1"
-    )
-    if trace:
-        expert_rows = (counts[1:] - counts[:-1]).cpu().tolist()
-        logger.warning(
-            "Sonic multi-stream rank=%s call %d start: A=%s B=%s out=%s "
-            "rows=%s wgrad=%s",
-            local_rank,
-            _MULTISTREAM_CALLS,
-            tuple(work_a.shape),
-            tuple(work_b.shape),
-            tuple(work_out.shape),
-            expert_rows,
-            A_is_transposed,
-        )
     hipb_multistream_mm(
         work_a,
         work_b,
@@ -664,10 +604,6 @@ def _grouped_gemm_multistream(
         bias.to(dtype=input_dtype).contiguous() if bias is not None else None,
         B_is_transposed,
     )
-    if trace:
-        logger.warning(
-            "Sonic multi-stream rank=%s call %d done", local_rank, _MULTISTREAM_CALLS
-        )
 
     if out is None:
         if scatter_idx is None:
