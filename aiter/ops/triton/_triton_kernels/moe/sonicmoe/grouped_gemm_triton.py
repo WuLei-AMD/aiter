@@ -7,10 +7,43 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.sonicmoe_config_utils import (
     get_grouped_gemm_dw_config,
     get_grouped_gemm_fwd_config,
     split_launch_config,
+)
+
+_grouped_gemm_repr = make_kernel_repr(
+    "_grouped_gemm_kernel",
+    [
+        "N",
+        "K",
+        "E",
+        "SCALE_BLOCK_SIZE",
+        "BLOCKWISE_FP8",
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_SIZE_M",
+        "HAS_BIAS",
+        "HAS_GATHER_IDX",
+        "HAS_SCATTER_IDX",
+    ],
+)
+_grouped_gemm_dw_repr = make_kernel_repr(
+    "_grouped_gemm_dw_kernel",
+    [
+        "N",
+        "K",
+        "E",
+        "SCALE_BLOCK_SIZE",
+        "BLOCKWISE_FP8",
+        "BLOCK_K",
+        "BLOCK_N",
+        "BLOCK_T",
+        "HAS_GATHER_IDX",
+    ],
 )
 
 
@@ -33,13 +66,7 @@ def _cu_seqlens_cache_key(cu_seqlens: torch.Tensor) -> tuple[int, int]:
 def register_host_cu_seqlens(
     cu_seqlens: torch.Tensor, host_cu_seqlens: torch.Tensor
 ) -> None:
-    """Associate GPU offsets with dispatcher-produced CPU offsets.
-
-    The multi-stream backend launches one hipBLASLt GEMM per expert and therefore
-    needs offsets on the host. Keeping the host copy produced at the Megatron
-    dispatcher boundary avoids synchronously copying the same GPU tensor before
-    every forward and backward GEMM.
-    """
+    """Cache host offsets to avoid GPU-to-CPU syncs in the multi-stream backend."""
     if cu_seqlens.device.type != "cuda":
         raise ValueError("cu_seqlens cache keys must be GPU tensors")
     host_cu_seqlens = host_cu_seqlens.to(
@@ -89,110 +116,11 @@ def _local_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
     return tensor
 
 
-_QWEN3_FWD_CONFIGS = {
-    (1536, 2048, 16, True): {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 64,
-        "num_warps": 4,
-        "num_stages": 2,
-    },
-    # Pre-routed Sonic expert w1 forward has no gather index.
-    (1536, 2048, 16, False): {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 64,
-        "num_warps": 4,
-        "num_stages": 2,
-    },
-    (2048, 768, 16, False): {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 64,
-        "num_warps": 4,
-        "num_stages": 2,
-    },
-    (768, 2048, 16, False): {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 64,
-        "num_warps": 4,
-        "num_stages": 2,
-    },
-    (2048, 1536, 16, False): {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 64,
-        "num_warps": 4,
-        "num_stages": 2,
-    },
-}
-
-_QWEN3_DW_CONFIGS = {
-    (1536, 2048, 16, True): {
-        "BLOCK_K": 128,
-        "BLOCK_N": 128,
-        "BLOCK_T": 64,
-        "num_warps": 4,
-        "num_stages": 2,
-    },
-    # Pre-routed Sonic expert w1 wgrad has no gather index.
-    (1536, 2048, 16, False): {
-        "BLOCK_K": 128,
-        "BLOCK_N": 128,
-        "BLOCK_T": 64,
-        "num_warps": 4,
-        "num_stages": 2,
-    },
-    (2048, 768, 16, False): {
-        "BLOCK_K": 128,
-        "BLOCK_N": 128,
-        "BLOCK_T": 32,
-        "num_warps": 4,
-        "num_stages": 2,
-    },
-}
-
-
 def _use_qwen3_tuned_configs() -> bool:
     return os.environ.get("SONIC_MOE_USE_QWEN3_TUNED_GEMM", "0") == "1"
 
 
-def _get_fwd_autotune_configs():
-    configs = []
-    for BLOCK_M in [32, 64, 128]:
-        for BLOCK_N in [32, 64, 128]:
-            for BLOCK_K in [32, 64]:
-                for num_warps in [4, 8]:
-                    for num_stages in [2, 4]:
-                        if BLOCK_M * BLOCK_N <= 16384 and BLOCK_M * BLOCK_K <= 8192:
-                            configs.append(
-                                triton.Config(
-                                    {
-                                        "BLOCK_M": BLOCK_M,
-                                        "BLOCK_N": BLOCK_N,
-                                        "BLOCK_K": BLOCK_K,
-                                    },
-                                    num_warps=num_warps,
-                                    num_stages=num_stages,
-                                )
-                            )
-    return configs
-
-
-def _prune_fwd_configs(configs, nargs, **kw):
-    K = kw.get("K", nargs.get("K", 9999))
-    N = kw.get("N", nargs.get("N", 9999))
-    pruned = []
-    for c in configs:
-        bk = c.kwargs["BLOCK_K"]
-        bn = c.kwargs["BLOCK_N"]
-        if bk <= triton.next_power_of_2(K) and bn <= triton.next_power_of_2(N):
-            pruned.append(c)
-    return pruned if pruned else configs
-
-
-@triton.jit
+@triton.jit(repr=_grouped_gemm_repr)
 def _grouped_gemm_kernel(
     A_ptr,
     B_ptr,
@@ -355,47 +283,7 @@ def _grouped_gemm_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-_grouped_gemm_kernel_autotuned = triton.autotune(
-    configs=_get_fwd_autotune_configs(),
-    key=["N", "K", "E"],
-    prune_configs_by={"early_config_prune": _prune_fwd_configs},
-)(_grouped_gemm_kernel)
-
-
-def _get_dw_autotune_configs():
-    configs = []
-    for BLOCK_K in [32, 64, 128]:
-        for BLOCK_N in [32, 64, 128]:
-            for BLOCK_T in [16, 32, 64]:
-                for num_warps in [4, 8]:
-                    if BLOCK_K * BLOCK_N <= 16384 and BLOCK_T * BLOCK_K <= 8192:
-                        configs.append(
-                            triton.Config(
-                                {
-                                    "BLOCK_K": BLOCK_K,
-                                    "BLOCK_N": BLOCK_N,
-                                    "BLOCK_T": BLOCK_T,
-                                },
-                                num_warps=num_warps,
-                                num_stages=2,
-                            )
-                        )
-    return configs
-
-
-def _prune_dw_configs(configs, nargs, **kw):
-    K = kw.get("K", nargs.get("K", 9999))
-    N = kw.get("N", nargs.get("N", 9999))
-    pruned = []
-    for c in configs:
-        bk = c.kwargs["BLOCK_K"]
-        bn = c.kwargs["BLOCK_N"]
-        if bk <= triton.next_power_of_2(K) and bn <= triton.next_power_of_2(N):
-            pruned.append(c)
-    return pruned if pruned else configs
-
-
-@triton.jit
+@triton.jit(repr=_grouped_gemm_dw_repr)
 def _grouped_gemm_dw_kernel(
     A_ptr,
     B_ptr,
@@ -516,13 +404,6 @@ def _grouped_gemm_dw_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-_grouped_gemm_dw_kernel_autotuned = triton.autotune(
-    configs=_get_dw_autotune_configs(),
-    key=["N", "K", "E"],
-    prune_configs_by={"early_config_prune": _prune_dw_configs},
-)(_grouped_gemm_dw_kernel)
-
-
 def _compute_grid_fwd(cu_seqlens_cpu, N, E, BLOCK_M, BLOCK_N):
     total_blocks = 0
     for e in range(E):
@@ -546,12 +427,7 @@ def grouped_gemm(
     block_size: int = 128,
     out_dtype: torch.dtype | None = None,
 ):
-    """Grouped GEMM. Optional ``A_scale``/``B_scale`` enable blockwise FP8.
-
-    When scales are set, ``A`` is 1×``block_size`` (default 128) activations
-    and ``B`` is 128×128 weight tiles. Used for Qwen3-style expert forward,
-    dgrad (``B_is_transposed``), and wgrad (``A_is_transposed``).
-    """
+    """Run grouped GEMM, optionally with 1x128 activation and 128x128 weight scales."""
     blockwise_fp8 = A_scale is not None or B_scale is not None
     if blockwise_fp8:
         if A_scale is None or B_scale is None:
@@ -904,17 +780,11 @@ def _grouped_gemm_triton(
         "HAS_GATHER_IDX": (A_idx is not None),
         "HAS_SCATTER_IDX": (scatter_idx is not None),
     }
-    fixed = _QWEN3_FWD_CONFIGS.get((N, K_dim, E, A_idx is not None))
-    fwd_cfg = get_grouped_gemm_fwd_config(N, K_dim, E)
-    if _use_qwen3_tuned_configs() and fixed is not None:
-        _grouped_gemm_kernel[grid](*launch_args, **launch_meta, GROUP_SIZE_M=8, **fixed)
-    elif fwd_cfg is not None:
-        constexprs, launch = split_launch_config(fwd_cfg)
-        _grouped_gemm_kernel[grid](*launch_args, **launch_meta, **constexprs, **launch)
-    else:
-        _grouped_gemm_kernel_autotuned[grid](
-            *launch_args, **launch_meta, GROUP_SIZE_M=8
-        )
+    fwd_cfg = get_grouped_gemm_fwd_config(
+        N, K_dim, E, A_idx is not None, _use_qwen3_tuned_configs()
+    )
+    constexprs, launch = split_launch_config(fwd_cfg)
+    _grouped_gemm_kernel[grid](*launch_args, **launch_meta, **constexprs, **launch)
     return out
 
 
@@ -993,15 +863,11 @@ def _grouped_gemm_dw(
         "BLOCKWISE_FP8": blockwise_fp8,
         "HAS_GATHER_IDX": A_idx is not None,
     }
-    fixed = _QWEN3_DW_CONFIGS.get((N, K_dim, E, A_idx is not None))
-    dw_cfg = get_grouped_gemm_dw_config(N, K_dim, E)
-    if _use_qwen3_tuned_configs() and fixed is not None:
-        _grouped_gemm_dw_kernel[grid](*launch_args, **launch_meta, **fixed)
-    elif dw_cfg is not None:
-        constexprs, launch = split_launch_config(dw_cfg)
-        _grouped_gemm_dw_kernel[grid](
-            *launch_args, **launch_meta, **constexprs, **launch
-        )
-    else:
-        _grouped_gemm_dw_kernel_autotuned[grid](*launch_args, **launch_meta)
+    dw_cfg = get_grouped_gemm_dw_config(
+        N, K_dim, E, A_idx is not None, _use_qwen3_tuned_configs()
+    )
+    constexprs, launch = split_launch_config(dw_cfg)
+    _grouped_gemm_dw_kernel[grid](
+        *launch_args, **launch_meta, **constexprs, **launch
+    )
     return out

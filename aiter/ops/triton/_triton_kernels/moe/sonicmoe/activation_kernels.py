@@ -2,12 +2,36 @@ import torch
 import triton
 import triton.language as tl
 
-# ============================================================================
-# GLU-family forward kernels (SwiGLU, GEGLU, ReGLU)
-# ============================================================================
+from aiter.ops.triton._triton_kernels.moe.activations import (
+    gelu_tanh,
+    gelu_tanh_grad,
+    relu,
+    relu_grad,
+    relu_sq,
+    relu_sq_grad,
+    silu,
+    silu_grad,
+)
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.sonicmoe_config_utils import (
+    get_sonicmoe_kernel_config,
+    split_launch_config,
+)
 
+_glu_fwd_repr = make_kernel_repr(
+    "sonicmoe_glu_fwd", ["I", "BLOCK_M", "BLOCK_I", "CONCAT_LAYOUT", "ACT_TYPE"]
+)
+_glu_bwd_repr = make_kernel_repr(
+    "sonicmoe_glu_bwd", ["I", "BLOCK_M", "BLOCK_I", "CONCAT_LAYOUT", "ACT_TYPE"]
+)
+_pointwise_act_fwd_repr = make_kernel_repr(
+    "sonicmoe_pointwise_act_fwd", ["I", "BLOCK_M", "BLOCK_I", "ACT_TYPE"]
+)
+_pointwise_act_bwd_repr = make_kernel_repr(
+    "sonicmoe_pointwise_act_bwd", ["I", "BLOCK_M", "BLOCK_I", "ACT_TYPE"]
+)
 
-@triton.jit
+@triton.jit(repr=_glu_fwd_repr)
 def _glu_fwd_kernel(
     h_ptr,
     a_ptr,
@@ -52,14 +76,11 @@ def _glu_fwd_kernel(
     ).to(tl.float32)
 
     if ACT_TYPE == 0:  # swiglu
-        act_gate = gate * tl.sigmoid(gate)
+        act_gate = silu(gate)
     elif ACT_TYPE == 1:  # geglu (tanh approx)
-        SQRT_2_OVER_PI: tl.constexpr = 0.7978845608028654
-        COEFF: tl.constexpr = 0.044715
-        inner = SQRT_2_OVER_PI * (gate + COEFF * gate * gate * gate)
-        act_gate = 0.5 * gate * (1.0 + tl.extra.hip.libdevice.tanh(inner))
+        act_gate = gelu_tanh(gate)
     elif ACT_TYPE == 2:  # reglu
-        act_gate = tl.where(gate > 0, gate, 0.0)
+        act_gate = relu(gate)
 
     out = act_gate * up
 
@@ -72,12 +93,7 @@ def _glu_fwd_kernel(
     )
 
 
-# ============================================================================
-# GLU-family backward kernels
-# ============================================================================
-
-
-@triton.jit
+@triton.jit(repr=_glu_bwd_repr)
 def _glu_bwd_kernel(
     h_ptr,
     dh_ptr,
@@ -132,25 +148,14 @@ def _glu_bwd_kernel(
     ).to(tl.float32)
 
     if ACT_TYPE == 0:  # swiglu
-        sig = tl.sigmoid(gate)
-        act_gate = gate * sig
-        d_up = da * act_gate
-        d_gate = da * up * sig * (1.0 + gate * (1.0 - sig))
+        d_up = da * silu(gate)
+        d_gate = da * up * silu_grad(gate)
     elif ACT_TYPE == 1:  # geglu (tanh approx)
-        SQRT_2_OVER_PI: tl.constexpr = 0.7978845608028654
-        COEFF: tl.constexpr = 0.044715
-        inner = SQRT_2_OVER_PI * (gate + COEFF * gate * gate * gate)
-        tanh_val = tl.extra.hip.libdevice.tanh(inner)
-        act_gate = 0.5 * gate * (1.0 + tanh_val)
-        d_up = da * act_gate
-        dtanh = 1.0 - tanh_val * tanh_val
-        dinner = SQRT_2_OVER_PI * (1.0 + 3.0 * COEFF * gate * gate)
-        d_gate = da * up * (0.5 * (1.0 + tanh_val) + 0.5 * gate * dtanh * dinner)
+        d_up = da * gelu_tanh(gate)
+        d_gate = da * up * gelu_tanh_grad(gate)
     elif ACT_TYPE == 2:  # reglu
-        relu_mask = gate > 0
-        act_gate = tl.where(relu_mask, gate, 0.0)
-        d_up = da * act_gate
-        d_gate = da * up * tl.where(relu_mask, 1.0, 0.0)
+        d_up = da * relu(gate)
+        d_gate = da * up * relu_grad(gate)
 
     tl.store(
         dh_ptr
@@ -168,12 +173,7 @@ def _glu_bwd_kernel(
     )
 
 
-# ============================================================================
-# Non-GLU forward kernels (GELU, ReLU, SiLU, ReLU²)
-# ============================================================================
-
-
-@triton.jit
+@triton.jit(repr=_pointwise_act_fwd_repr)
 def _pointwise_act_fwd_kernel(
     h_ptr,
     a_ptr,
@@ -203,17 +203,13 @@ def _pointwise_act_fwd_kernel(
     ).to(tl.float32)
 
     if ACT_TYPE == 3:  # gelu (tanh approx)
-        SQRT_2_OVER_PI: tl.constexpr = 0.7978845608028654
-        COEFF: tl.constexpr = 0.044715
-        inner = SQRT_2_OVER_PI * (x + COEFF * x * x * x)
-        out = 0.5 * x * (1.0 + tl.extra.hip.libdevice.tanh(inner))
+        out = gelu_tanh(x)
     elif ACT_TYPE == 4:  # relu
-        out = tl.where(x > 0, x, 0.0)
+        out = relu(x)
     elif ACT_TYPE == 5:  # silu
-        out = x * tl.sigmoid(x)
+        out = silu(x)
     elif ACT_TYPE == 6:  # relu_sq
-        relu_x = tl.where(x > 0, x, 0.0)
-        out = relu_x * relu_x
+        out = relu_sq(x)
 
     tl.store(
         a_ptr
@@ -224,7 +220,7 @@ def _pointwise_act_fwd_kernel(
     )
 
 
-@triton.jit
+@triton.jit(repr=_pointwise_act_bwd_repr)
 def _pointwise_act_bwd_kernel(
     h_ptr,
     dh_ptr,
@@ -264,21 +260,13 @@ def _pointwise_act_bwd_kernel(
     ).to(tl.float32)
 
     if ACT_TYPE == 3:  # gelu (tanh approx)
-        SQRT_2_OVER_PI: tl.constexpr = 0.7978845608028654
-        COEFF: tl.constexpr = 0.044715
-        inner = SQRT_2_OVER_PI * (x + COEFF * x * x * x)
-        tanh_val = tl.extra.hip.libdevice.tanh(inner)
-        dtanh = 1.0 - tanh_val * tanh_val
-        dinner = SQRT_2_OVER_PI * (1.0 + 3.0 * COEFF * x * x)
-        dx = da * (0.5 * (1.0 + tanh_val) + 0.5 * x * dtanh * dinner)
+        dx = da * gelu_tanh_grad(x)
     elif ACT_TYPE == 4:  # relu
-        dx = da * tl.where(x > 0, 1.0, 0.0)
+        dx = da * relu_grad(x)
     elif ACT_TYPE == 5:  # silu
-        sig = tl.sigmoid(x)
-        dx = da * sig * (1.0 + x * (1.0 - sig))
+        dx = da * silu_grad(x)
     elif ACT_TYPE == 6:  # relu_sq
-        relu_mask = x > 0
-        dx = da * tl.where(relu_mask, 2.0 * x, 0.0)
+        dx = da * relu_sq_grad(x)
 
     tl.store(
         dh_ptr
@@ -289,18 +277,18 @@ def _pointwise_act_bwd_kernel(
     )
 
 
-# ============================================================================
-# Dispatcher functions
-# ============================================================================
-
 _GLU_ACT_MAP = {"swiglu": 0, "geglu": 1, "reglu": 2}
 _POINTWISE_ACT_MAP = {"gelu_tanh_approx": 3, "relu": 4, "silu": 5, "relu_sq": 6}
 
 
-def _launch_grid(TK, I, BLOCK_M=32, BLOCK_I=None):
-    if BLOCK_I is None:
-        BLOCK_I = min(triton.next_power_of_2(I), 1024)
-    return (triton.cdiv(TK, BLOCK_M), triton.cdiv(I, BLOCK_I)), BLOCK_M, BLOCK_I
+def _launch_config(TK, I):
+    config = get_sonicmoe_kernel_config("activation_kernel")
+    block_i = min(triton.next_power_of_2(I), config.pop("BLOCK_I_MAX"))
+    block_m = config["BLOCK_M"]
+    grid = (triton.cdiv(TK, block_m), triton.cdiv(I, block_i))
+    constexprs, launch = split_launch_config(config)
+    constexprs["BLOCK_I"] = block_i
+    return grid, constexprs, launch
 
 
 def activation_fwd(
@@ -310,7 +298,7 @@ def activation_fwd(
 
     if activation_type in _GLU_ACT_MAP:
         a = torch.empty(TK, I, dtype=h.dtype, device=h.device)
-        grid, BLOCK_M, BLOCK_I = _launch_grid(TK, I)
+        grid, constexprs, launch = _launch_config(TK, I)
         _glu_fwd_kernel[grid](
             h,
             a,
@@ -320,15 +308,15 @@ def activation_fwd(
             h.stride(1),
             a.stride(0),
             a.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_I=BLOCK_I,
             CONCAT_LAYOUT=concat_layout,
             ACT_TYPE=_GLU_ACT_MAP[activation_type],
+            **constexprs,
+            **launch,
         )
         return a
     elif activation_type in _POINTWISE_ACT_MAP:
         a = torch.empty(TK, I, dtype=h.dtype, device=h.device)
-        grid, BLOCK_M, BLOCK_I = _launch_grid(TK, I)
+        grid, constexprs, launch = _launch_config(TK, I)
         _pointwise_act_fwd_kernel[grid](
             h,
             a,
@@ -338,9 +326,9 @@ def activation_fwd(
             h.stride(1),
             a.stride(0),
             a.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_I=BLOCK_I,
             ACT_TYPE=_POINTWISE_ACT_MAP[activation_type],
+            **constexprs,
+            **launch,
         )
         return a
     else:
@@ -358,7 +346,7 @@ def activation_bwd(
 
     if activation_type in _GLU_ACT_MAP:
         dh = torch.empty_like(h)
-        grid, BLOCK_M, BLOCK_I = _launch_grid(TK, I)
+        grid, constexprs, launch = _launch_config(TK, I)
         _glu_bwd_kernel[grid](
             h,
             dh,
@@ -371,15 +359,15 @@ def activation_bwd(
             dh.stride(1),
             da.stride(0),
             da.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_I=BLOCK_I,
             CONCAT_LAYOUT=concat_layout,
             ACT_TYPE=_GLU_ACT_MAP[activation_type],
+            **constexprs,
+            **launch,
         )
         return dh
     elif activation_type in _POINTWISE_ACT_MAP:
         dh = torch.empty_like(h)
-        grid, BLOCK_M, BLOCK_I = _launch_grid(TK, I)
+        grid, constexprs, launch = _launch_config(TK, I)
         _pointwise_act_bwd_kernel[grid](
             h,
             dh,
@@ -392,9 +380,9 @@ def activation_bwd(
             dh.stride(1),
             da.stride(0),
             da.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_I=BLOCK_I,
             ACT_TYPE=_POINTWISE_ACT_MAP[activation_type],
+            **constexprs,
+            **launch,
         )
         return dh
     else:

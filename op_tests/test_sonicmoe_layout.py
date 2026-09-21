@@ -13,7 +13,8 @@ from aiter.ops.triton.sonicmoe import (
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 
 
-def test_general_routing_grouped_weights_match_legacy_layout():
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_general_routing_grouped_weights_match_legacy_layout(with_bias):
     torch.manual_seed(43)
     device = torch.device("cuda")
     tokens, hidden, intermediate, experts = 64, 64, 64, 2
@@ -49,11 +50,33 @@ def test_general_routing_grouped_weights_match_legacy_layout():
     )
     w1_legacy = w1_grouped.detach().permute(2, 1, 0).contiguous().requires_grad_(True)
     w2_legacy = w2_grouped.detach().permute(2, 1, 0).contiguous().requires_grad_(True)
+    b1_grouped = (
+        torch.randn(experts, 2 * intermediate, dtype=torch.bfloat16, device=device)
+        .requires_grad_(True)
+        if with_bias
+        else None
+    )
+    b2_grouped = (
+        torch.randn(experts, hidden, dtype=torch.bfloat16, device=device).requires_grad_(
+            True
+        )
+        if with_bias
+        else None
+    )
+    b1_legacy = (
+        b1_grouped.detach().clone().requires_grad_(True)
+        if with_bias
+        else None
+    )
+    b2_legacy = (
+        b2_grouped.detach().clone().requires_grad_(True)
+        if with_bias
+        else None
+    )
 
     common = (
         token_indices,
         expert_indices,
-        None,
         experts,
         torch.cuda.current_stream().cuda_stream,
         SonicMoEActivationType.SWIGLU,
@@ -66,10 +89,10 @@ def test_general_routing_grouped_weights_match_legacy_layout():
         common[0],
         common[1],
         w1_grouped,
-        common[2],
+        b1_grouped,
         w2_grouped,
-        common[2],
-        *common[3:],
+        b2_grouped,
+        *common[2:],
         grouped_weight_layout=True,
     )
     output_legacy, _ = moe_general_routing_inputs(
@@ -78,10 +101,10 @@ def test_general_routing_grouped_weights_match_legacy_layout():
         common[0],
         common[1],
         w1_legacy,
-        common[2],
+        b1_legacy,
         w2_legacy,
-        common[2],
-        *common[3:],
+        b2_legacy,
+        *common[2:],
     )
 
     torch.testing.assert_close(output_grouped, output_legacy)
@@ -92,3 +115,6 @@ def test_general_routing_grouped_weights_match_legacy_layout():
     torch.testing.assert_close(scores_grouped.grad, scores_legacy.grad)
     torch.testing.assert_close(w1_grouped.grad, w1_legacy.grad.permute(2, 1, 0))
     torch.testing.assert_close(w2_grouped.grad, w2_legacy.grad.permute(2, 1, 0))
+    if with_bias:
+        torch.testing.assert_close(b1_grouped.grad, b1_legacy.grad)
+        torch.testing.assert_close(b2_grouped.grad, b2_legacy.grad)

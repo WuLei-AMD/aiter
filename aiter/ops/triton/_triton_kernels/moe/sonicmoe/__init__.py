@@ -15,7 +15,6 @@ from .backward import (
 )
 from .enums import ActivationType, is_glu
 from .forward import _router_forward, _topk_softmax_bwd, _topk_softmax_fwd
-from .grouped_gemm_triton import grouped_gemm
 from .routing import (
     TC_topk_router_metadata_triton,
     general_routing_router_metadata_triton,
@@ -125,9 +124,7 @@ class _UpProjection(torch.autograd.Function):
         I = I_full // 2 if is_glu_activation else I_full
         TK = total_expert_freq
 
-        # Step 1: grouped GEMM — h = x[gather_idx] @ w1 per expert
-        # w1 is (I_full, H, E), permute to (E, H, I_full) for grouped gemm: A=(TK,H), B=(E,H,I_full) -> C=(TK,I_full)
-        # But grouped_gemm expects B=(E, K_dim, N), so B=(E, H, I_full)
+        # Compute each expert's up projection in grouped layout.
         h = torch.empty(TK, I_full, dtype=x.dtype, device=x.device)
         grouped_gemm(
             x,
@@ -138,10 +135,8 @@ class _UpProjection(torch.autograd.Function):
             A_idx=None if inputs_are_pre_routed else x_gather_idx,
         )
 
-        # Step 2: activation
         a = activation_fwd(h, I, activation_type.value, concat_layout)
 
-        # Save for backward
         h_save = h if not is_inference_mode_enabled else None
 
         ctx.T = T
@@ -213,12 +208,7 @@ class _UpProjection(torch.autograd.Function):
             grouped_weight_layout=ctx.grouped_weight_layout,
         )
 
-        # dW1: x^T @ dh per expert
-        # x is (T, H), dh is (TK, I_full)
-        # We need: for each expert e, dw1_e = x[gather_idx[rows_e]]^T @ dh[rows_e]
-        # This is A^T @ B with A_idx=gather for A
-        # x.T is (H, T), with A_idx gather it becomes (H, TK_e), times dh (TK_e, I_full) -> (H, I_full)
-        # But dw1 shape is (I_full, H, E) and permuted is (E, H, I_full)
+        # Compute dW1 as grouped x.T @ dh.
         grouped_gemm(
             x,
             (
@@ -289,12 +279,10 @@ class _DownProjection(torch.autograd.Function):
                 )
             gemm_w2 = w2.permute(2, 1, 0)
 
-        # Grouped GEMM: y = a @ w2 per expert
-        # w2 is (H, I, E), permute to (E, I, H) for B: A=(TK, I), B=(E, I, H) -> C=(TK, H)
+        # Compute each expert's down projection.
         y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
         grouped_gemm(a, gemm_w2, expert_frequency_offset, out=y, bias=b2)
 
-        # Router weighted reduction
         o = torch.empty(T, H, device=a.device, dtype=a.dtype)
         topk_scores_flat = topk_scores.view(-1)
 
@@ -373,15 +361,11 @@ class _DownProjection(torch.autograd.Function):
             concat_layout=ctx.concat_layout,
         )
 
-        # dW2: a_prime^T @ dy per expert
-        # We need to recompute dy = dout[gather_idx] * s for dW
+        # Compute dW2 as grouped activation.T @ routed output gradient.
         s = topk_scores[s_scatter_idx]
         dout_gathered = dout[x_gather_idx]
         dy = dout_gathered * s.unsqueeze(-1)
 
-        # a_prime is (TK, I), dy is (TK, H)
-        # dw2_e = a_prime[rows_e]^T @ dy[rows_e] -> (I, H)
-        # dw2 shape is (H, I, E), permute(2,1,0) = (E, I, H)
         grouped_gemm(
             a_prime,
             dy,
@@ -584,13 +568,7 @@ def moe_pre_routed_inputs(
     concat_layout: bool = False,
     grouped_weight_layout: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run SonicMoE on tokens already grouped by local expert.
-
-    ``x`` and ``router_scores`` must use the expert-major order described by
-    ``expert_frequency``. This is the format produced by Megatron's AllToAll
-    token dispatcher, so rebuilding and sorting general-routing metadata is
-    unnecessary.
-    """
+    """Run SonicMoE on expert-major tokens from an all-to-all dispatcher."""
     del stream_id
 
     T = x.size(0)

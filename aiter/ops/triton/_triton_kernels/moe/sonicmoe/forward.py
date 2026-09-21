@@ -2,8 +2,19 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 from .enums import LIBRARY_NAME
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
+
+_softmax_over_topk_bwd_repr = make_kernel_repr(
+    "sonicmoe_softmax_over_topk_bwd",
+    ["K", "BLOCK_K", "dlogits_is_none"],
+)
+_topk_over_softmax_bwd_repr = make_kernel_repr(
+    "sonicmoe_topk_over_softmax_bwd",
+    ["E", "K", "BLOCK_E", "BLOCK_K", "norm_topk_probs"],
+)
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_router_forward_rocm", mutates_args={"o"})
@@ -58,7 +69,7 @@ def _topk_softmax_fwd(
         topk_router_indices.copy_(topk_results.indices.to(topk_router_indices.dtype))
 
 
-@triton.jit
+@triton.jit(repr=_softmax_over_topk_bwd_repr)
 def _softmax_over_topk_bwd_kernel(
     dlogits_ptr,
     dlogits_full_ptr,
@@ -100,7 +111,7 @@ def _softmax_over_topk_bwd_kernel(
     tl.store(dlogits_full_ptr + indices, add_vals, mask=k_mask)
 
 
-@triton.jit
+@triton.jit(repr=_topk_over_softmax_bwd_repr)
 def _topk_over_softmax_bwd_kernel(
     logits_ptr,
     dlogits_ptr,

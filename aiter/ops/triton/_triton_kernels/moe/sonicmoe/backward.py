@@ -2,33 +2,27 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.sonicmoe_config_utils import (
+    get_sonicmoe_kernel_config,
+    split_launch_config,
+)
+
 from .activation_kernels import activation_bwd, activation_fwd
 from .enums import LIBRARY_NAME
 from .grouped_gemm_triton import grouped_gemm
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 
-
-def _get_powers_of_2(start: int, end: int) -> list[int]:
-    output = []
-    n = start
-    while n <= end:
-        output.append(n)
-        n = n << 1
-    return output
-
-
-def _get_autotune_configs_for_db2_and_ds() -> list[triton.Config]:
-    configs = []
-    for BLOCK_TK in _get_powers_of_2(4, 32):
-        configs.append(triton.Config({"BLOCK_TK": BLOCK_TK}, num_warps=8, num_stages=4))
-    return configs
-
-
-@triton.autotune(
-    configs=_get_autotune_configs_for_db2_and_ds(),
-    key=["H", "E"],
+_db2_and_ds_repr = make_kernel_repr(
+    "sonicmoe_db2_and_ds",
+    ["H", "E", "OLD_DS_PARTIAL_N", "BLOCK_H", "BLOCK_TK", "BLOCK_OLD_DS_PARTIAL_N"],
 )
-@triton.jit
+_db1_repr = make_kernel_repr(
+    "sonicmoe_db1", ["I", "E", "BLOCK_I", "BLOCK_TK", "CONCAT_LAYOUT"]
+)
+
+
+@triton.jit(repr=_db2_and_ds_repr)
 def db2_and_ds_kernel(
     dout_ptr,
     s_ptr,
@@ -107,35 +101,7 @@ def db2_and_ds_kernel(
     tl.store(db2_ptr + Eidx * H + h_offsets, db2_acc, mask=h_mask)
 
 
-def _get_autotune_configs_for_db1() -> list[triton.Config]:
-    configs = []
-    for BLOCK_TK in _get_powers_of_2(4, 128):
-        for BLOCK_I in _get_powers_of_2(64, 4096):
-            if 4096 <= BLOCK_I * BLOCK_TK <= 16384:
-                configs.append(
-                    triton.Config(
-                        {"BLOCK_I": BLOCK_I, "BLOCK_TK": BLOCK_TK},
-                        num_warps=8,
-                        num_stages=4,
-                    )
-                )
-    return configs
-
-
-def _prune_triton_autotune_config(configs, nargs, **kw):
-    pruned_configs = []
-    for c in configs:
-        if c.kwargs["BLOCK_I"] <= triton.next_power_of_2(nargs["I"]):
-            pruned_configs.append(c)
-    return pruned_configs
-
-
-@triton.autotune(
-    configs=_get_autotune_configs_for_db1(),
-    key=["I", "E"],
-    prune_configs_by={"early_config_prune": _prune_triton_autotune_config},
-)
-@triton.jit
+@triton.jit(repr=_db1_repr)
 def db1_kernel(
     dh_ptr,
     db1_ptr,
@@ -209,6 +175,8 @@ def _up_projection_backward_act(
     )
 
     if db1 is not None:
+        db1_cfg = get_sonicmoe_kernel_config("db1_kernel")
+        constexprs, launch = split_launch_config(db1_cfg)
         db1_kernel[(E,)](
             dh,
             db1,
@@ -216,6 +184,8 @@ def _up_projection_backward_act(
             (2 * I if is_glu_activation else I),
             E,
             CONCAT_LAYOUT=concat_layout and is_glu_activation,
+            **constexprs,
+            **launch,
         )
 
 
@@ -277,12 +247,15 @@ def _down_projection_backward_act(
         )
         old_ds_partial[s_scatter_idx, 0] = ds_scattered
 
-        BLOCK_H = min(triton.next_power_of_2(H), 2048)
+        db2_cfg = get_sonicmoe_kernel_config("db2_and_ds_kernel")
+        block_h_max = db2_cfg.pop("BLOCK_H_MAX")
+        BLOCK_H = min(triton.next_power_of_2(H), block_h_max)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
         new_ds_partial = torch.empty(
             TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device
         )
 
+        constexprs, launch = split_launch_config(db2_cfg)
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
             dout,
             topk_scores,
@@ -297,7 +270,8 @@ def _down_projection_backward_act(
             E,
             1,
             BLOCK_H=BLOCK_H,
-            BLOCK_OLD_DS_PARTIAL_N=1,
+            **constexprs,
+            **launch,
         )
 
         if NUM_H_BLOCKS == 1:
