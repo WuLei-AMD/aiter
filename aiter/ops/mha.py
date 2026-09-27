@@ -478,6 +478,36 @@ def fmha_fwd_bf16_opus_fwd(
     return (out, lse) if return_lse else out
 
 
+def fmha_fwd_bf16_opus_supported(q: Tensor, k: Tensor, v: Tensor) -> bool:
+    """Return whether the explicit dense OPUS forward supports these tensors."""
+    try:
+        if get_gfx() != "gfx950":
+            return False
+        if q.dtype != dtypes.bf16 or k.dtype != q.dtype or v.dtype != q.dtype:
+            return False
+        if q.device != k.device or q.device != v.device:
+            return False
+        if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+            return False
+        if q.size(0) != k.size(0) or k.shape[:3] != v.shape[:3]:
+            return False
+        if q.size(2) % k.size(2) != 0 or q.stride(-1) != 1:
+            return False
+        if k.stride(-1) != 1 or v.stride(-1) != 1:
+            return False
+        hdim_q, hdim_v = q.size(-1), v.size(-1)
+        if k.size(-1) != hdim_q:
+            return False
+        if hdim_q == 192 and hdim_v == 128:
+            return True
+        if hdim_q != 128 or hdim_v != 128:
+            return False
+        kv_stride = max(k.stride(1), v.stride(1))
+        return k.size(1) * kv_stride * k.element_size() < (1 << 32)
+    except (AttributeError, RuntimeError, TypeError):
+        return False
+
+
 def fmha_fwd_bf16_opus_varlen_fwd(
     q: Tensor,
     k: Tensor,
