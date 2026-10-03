@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -5,6 +7,7 @@ from .grouped_gemm_triton import (
     _local_tensor,
     clear_registered_host_cu_seqlens,
     grouped_gemm,
+    grouped_gemm_swiglu,
     register_host_cu_seqlens,
 )
 from .activation_kernels import activation_fwd, activation_bwd
@@ -129,17 +132,36 @@ class _UpProjection(torch.autograd.Function):
         # w1 is (I_full, H, E), permute to (E, H, I_full) for grouped gemm: A=(TK,H), B=(E,H,I_full) -> C=(TK,I_full)
         # But grouped_gemm expects B=(E, K_dim, N), so B=(E, H, I_full)
         h = torch.empty(TK, I_full, dtype=x.dtype, device=x.device)
-        grouped_gemm(
-            x,
-            gemm_w1,  # (E, H, I_full)
-            expert_frequency_offset,
-            out=h,
-            bias=b1,
-            A_idx=None if inputs_are_pre_routed else x_gather_idx,
+        fused_swiglu = (
+            os.environ.get("LUMEN_EXPERT_FUSED_SWIGLU", "0") == "1"
+            and os.environ.get("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton")
+            == "triton"
+            and inputs_are_pre_routed
+            and grouped_weight_layout
+            and activation_type == ActivationType.SWIGLU
+            and not concat_layout
+            and b1 is None
+            and x.dtype == torch.bfloat16
         )
-
-        # Step 2: activation
-        a = activation_fwd(h, I, activation_type.value, concat_layout)
+        if fused_swiglu:
+            a = torch.empty(TK, I, dtype=x.dtype, device=x.device)
+            grouped_gemm_swiglu(
+                x,
+                gemm_w1,
+                expert_frequency_offset,
+                h,
+                a,
+            )
+        else:
+            grouped_gemm(
+                x,
+                gemm_w1,  # (E, H, I_full)
+                expert_frequency_offset,
+                out=h,
+                bias=b1,
+                A_idx=None if inputs_are_pre_routed else x_gather_idx,
+            )
+            a = activation_fwd(h, I, activation_type.value, concat_layout)
 
         # Save for backward
         h_save = h if not is_inference_mode_enabled else None

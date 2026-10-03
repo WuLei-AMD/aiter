@@ -362,6 +362,183 @@ _grouped_gemm_kernel_autotuned = triton.autotune(
 )(_grouped_gemm_kernel)
 
 
+@triton.jit
+def _grouped_gemm_swiglu_kernel(
+    A_ptr,
+    B_ptr,
+    cu_seqlens_ptr,
+    H_ptr,
+    activation_ptr,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_hm,
+    stride_hn,
+    stride_act_m,
+    stride_act_n,
+    I: tl.constexpr,
+    K: tl.constexpr,
+    E: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Grouped up-projection with an interleaved SwiGLU epilogue."""
+    pid = tl.program_id(0)
+    cumulative_blocks = 0
+    expert_id = 0
+    expert_start = 0
+    expert_end = 0
+
+    for e in range(E):
+        start = tl.load(cu_seqlens_ptr + e).to(tl.int32)
+        end = tl.load(cu_seqlens_ptr + e + 1).to(tl.int32)
+        blocks = tl.cdiv(end - start, BLOCK_M) * tl.cdiv(I, BLOCK_I)
+        if pid >= cumulative_blocks and pid < cumulative_blocks + blocks:
+            expert_id = e
+            expert_start = start
+            expert_end = end
+        cumulative_blocks += blocks
+
+    if pid >= cumulative_blocks:
+        return
+
+    local_pid = pid
+    for e in range(E):
+        if e < expert_id:
+            start = tl.load(cu_seqlens_ptr + e).to(tl.int32)
+            end = tl.load(cu_seqlens_ptr + e + 1).to(tl.int32)
+            local_pid -= tl.cdiv(end - start, BLOCK_M) * tl.cdiv(I, BLOCK_I)
+
+    expert_rows = expert_end - expert_start
+    num_pid_m = tl.cdiv(expert_rows, BLOCK_M)
+    num_pid_i: tl.constexpr = tl.cdiv(I, BLOCK_I)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_i
+    group_id = local_pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (local_pid % num_pid_in_group) % group_size_m
+    pid_i = (local_pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    offs_n = pid_i * (2 * BLOCK_I) + tl.arange(0, 2 * BLOCK_I)
+    offs_k = tl.arange(0, BLOCK_K)
+    m_mask = offs_m < expert_rows
+    i_mask = offs_i < I
+    n_mask = offs_n < 2 * I
+    global_m = expert_start + offs_m
+
+    acc = tl.zeros((BLOCK_M, 2 * BLOCK_I), dtype=tl.float32)
+    expert_id_i64 = expert_id.to(tl.int64)
+    for k_start in range(0, K, BLOCK_K):
+        k_offs = k_start + offs_k
+        k_mask = k_offs < K
+        a = tl.load(
+            A_ptr
+            + global_m[:, None].to(tl.int64) * stride_am
+            + k_offs[None, :].to(tl.int64) * stride_ak,
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            B_ptr
+            + expert_id_i64 * stride_be
+            + k_offs[:, None].to(tl.int64) * stride_bk
+            + offs_n[None, :].to(tl.int64) * stride_bn,
+            mask=k_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        )
+        acc += tl.dot(a, b)
+
+    # Preserve the original BF16 GEMM -> FP32 activation rounding order.
+    h = acc.to(H_ptr.dtype.element_ty)
+    pairs = tl.reshape(h, (BLOCK_M, BLOCK_I, 2))
+    gate_bf16, up_bf16 = tl.split(pairs)
+    gate = gate_bf16.to(tl.float32)
+    up = up_bf16.to(tl.float32)
+    activation = gate * tl.sigmoid(gate) * up
+
+    tl.store(
+        H_ptr
+        + global_m[:, None].to(tl.int64) * stride_hm
+        + offs_n[None, :].to(tl.int64) * stride_hn,
+        h,
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+    tl.store(
+        activation_ptr
+        + global_m[:, None].to(tl.int64) * stride_act_m
+        + offs_i[None, :].to(tl.int64) * stride_act_n,
+        activation.to(activation_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & i_mask[None, :],
+    )
+
+
+def grouped_gemm_swiglu(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    H: torch.Tensor,
+    activation: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse Qwen3's pre-routed BF16 up-projection and interleaved SwiGLU."""
+    A = _local_tensor(A)
+    B = _local_tensor(B)
+    cu_seqlens = _local_tensor(cu_seqlens)
+    H = _local_tensor(H)
+    activation = _local_tensor(activation)
+
+    E, K, N = B.shape
+    I = N // 2
+    if (
+        A.dtype != torch.bfloat16
+        or B.dtype != torch.bfloat16
+        or N % 2
+        or tuple(H.shape) != (A.shape[0], N)
+        or tuple(activation.shape) != (A.shape[0], I)
+        or cu_seqlens.numel() != E + 1
+    ):
+        raise ValueError("fused SwiGLU requires Qwen3-style BF16 tensors")
+    if not all(t.is_contiguous() for t in (A, B, H, activation)):
+        raise ValueError("fused SwiGLU requires contiguous tensors")
+
+    block_m, block_i, block_k = 128, 64, 64
+    grid = (
+        (triton.cdiv(A.shape[0], block_m) + E - 1)
+        * triton.cdiv(I, block_i),
+    )
+    _grouped_gemm_swiglu_kernel[grid](
+        A,
+        B,
+        cu_seqlens,
+        H,
+        activation,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        B.stride(2),
+        H.stride(0),
+        H.stride(1),
+        activation.stride(0),
+        activation.stride(1),
+        I=I,
+        K=K,
+        E=E,
+        BLOCK_M=block_m,
+        BLOCK_I=block_i,
+        BLOCK_K=block_k,
+        GROUP_SIZE_M=8,
+        num_warps=4,
+        num_stages=2,
+    )
+    return H, activation
+
+
 def _get_dw_autotune_configs():
     configs = []
     for BLOCK_K in [32, 64, 128]:
