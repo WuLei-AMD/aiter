@@ -291,6 +291,8 @@ class _DownProjection(torch.autograd.Function):
         activation_type: ActivationType,
         grouped_weight_layout: bool,
         concat_layout: bool,
+        inputs_are_pre_routed: bool = False,
+        scores_are_one: bool = False,
     ) -> torch.Tensor:
         TK = a.size(0)
         E = expert_frequency_offset.numel() - 1
@@ -337,6 +339,8 @@ class _DownProjection(torch.autograd.Function):
         ctx.activation_type = activation_type
         ctx.grouped_weight_layout = grouped_weight_layout
         ctx.concat_layout = concat_layout
+        ctx.inputs_are_pre_routed = inputs_are_pre_routed
+        ctx.scores_are_one = scores_are_one
 
         ctx.save_for_backward(
             h,
@@ -393,13 +397,27 @@ class _DownProjection(torch.autograd.Function):
             activation_type=activation_type.value,
             grouped_weight_layout=ctx.grouped_weight_layout,
             concat_layout=ctx.concat_layout,
+            inputs_are_pre_routed=ctx.inputs_are_pre_routed,
         )
 
-        # dW2: a_prime^T @ dy per expert
-        # We need to recompute dy = dout[gather_idx] * s for dW
-        s = topk_scores[s_scatter_idx]
-        dout_gathered = dout[x_gather_idx]
-        dy = dout_gathered * s.unsqueeze(-1)
+        # dW2: a_prime^T @ dy per expert.
+        # Pre-routed tokens are already gathered. A score of one does not
+        # change the BF16 value, so the FP32 multiply would only round-trip it.
+        if ctx.inputs_are_pre_routed and dout.is_contiguous():
+            dout_gathered = dout
+        else:
+            dout_gathered = dout[x_gather_idx]
+        if ctx.scores_are_one:
+            dy = dout_gathered
+        else:
+            s = (
+                topk_scores
+                if ctx.inputs_are_pre_routed
+                and topk_scores.is_contiguous()
+                and topk_scores.dim() == 1
+                else topk_scores[s_scatter_idx]
+            )
+            dy = dout_gathered * s.unsqueeze(-1)
 
         # a_prime is (TK, I), dy is (TK, H)
         # dw2_e = a_prime[rows_e]^T @ dy[rows_e] -> (I, H)
@@ -415,7 +433,7 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dh, dw2, db2, ds, *[None] * 11
+        return None, dh, dw2, db2, ds, *[None] * 13
 
 
 def moe_TC_softmax_topk_layer(
@@ -605,6 +623,7 @@ def moe_pre_routed_inputs(
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
     grouped_weight_layout: bool = True,
+    scores_are_one: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run SonicMoE on tokens already grouped by local expert.
 
@@ -685,5 +704,7 @@ def moe_pre_routed_inputs(
         activation_type,
         grouped_weight_layout,
         concat_layout,
+        True,
+        scores_are_one,
     )
     return o, expert_frequency

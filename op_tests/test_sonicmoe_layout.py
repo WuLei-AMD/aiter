@@ -153,3 +153,45 @@ def test_pre_routed_fused_swiglu_matches_separate_kernel(monkeypatch):
     torch.testing.assert_close(w1_fused.grad, w1_ref.grad, rtol=0, atol=0)
     torch.testing.assert_close(w2_fused.grad, w2_ref.grad, rtol=0, atol=0)
     torch.testing.assert_close(scores_fused.grad, scores_ref.grad, rtol=0, atol=0)
+
+
+def test_pre_routed_ones_score_matches_explicit_multiply(monkeypatch):
+    monkeypatch.setenv("LUMEN_EXPERT_FUSED_SWIGLU", "1")
+    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton")
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    counts = torch.tensor([17, 0, 31], dtype=torch.int32, device=device)
+    tokens, hidden, intermediate, experts = int(counts.sum()), 64, 64, 3
+    x_ref = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device, requires_grad=True)
+    x_fast = x_ref.detach().clone().requires_grad_(True)
+    ones_ref = torch.ones(tokens, dtype=torch.float32, device=device, requires_grad=True)
+    ones_fast = ones_ref.detach().clone().requires_grad_(True)
+    w1_ref = torch.randn(experts, hidden, 2 * intermediate, dtype=torch.bfloat16, device=device, requires_grad=True)
+    w2_ref = torch.randn(experts, intermediate, hidden, dtype=torch.bfloat16, device=device, requires_grad=True)
+    w1_fast = w1_ref.detach().clone().requires_grad_(True)
+    w2_fast = w2_ref.detach().clone().requires_grad_(True)
+
+    def run(x, w1, w2, scores, scores_are_one):
+        return moe_pre_routed_inputs(
+            x,
+            scores,
+            counts,
+            w1,
+            None,
+            w2,
+            None,
+            torch.cuda.current_stream().cuda_stream,
+            SonicMoEActivationType.SWIGLU,
+            scores_are_one=scores_are_one,
+        )[0]
+
+    out_ref = run(x_ref, w1_ref, w2_ref, ones_ref, False)
+    out_fast = run(x_fast, w1_fast, w2_fast, ones_fast, True)
+    torch.testing.assert_close(out_fast, out_ref, rtol=0, atol=0)
+    grad = torch.randn_like(out_ref)
+    out_ref.backward(grad)
+    out_fast.backward(grad)
+    torch.testing.assert_close(x_fast.grad, x_ref.grad, rtol=0, atol=0)
+    torch.testing.assert_close(w1_fast.grad, w1_ref.grad, rtol=0, atol=0)
+    torch.testing.assert_close(w2_fast.grad, w2_ref.grad, rtol=0, atol=0)
+    torch.testing.assert_close(ones_fast.grad, ones_ref.grad, rtol=0, atol=0)

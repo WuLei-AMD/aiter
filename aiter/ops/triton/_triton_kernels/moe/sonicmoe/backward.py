@@ -241,6 +241,7 @@ def _down_projection_backward_act(
     activation_type: str,
     grouped_weight_layout: bool = False,
     concat_layout: bool = False,
+    inputs_are_pre_routed: bool = False,
 ) -> None:
     if grouped_weight_layout:
         E, I, H = w2.size()
@@ -249,11 +250,15 @@ def _down_projection_backward_act(
         H, I, E = w2.size()
         gemm_w2 = w2.permute(2, 0, 1)
     TK = x_gather_idx.size(0)
-    s = topk_scores[s_scatter_idx]
-
-    # Compute u = dout @ w2.T once. The router gradient reuses this GEMM:
-    # dot(dout, a @ w2) == dot(a, dout @ w2.T), while da = score * u.
-    dout_gathered = dout[x_gather_idx]
+    # Pre-routed rows are already in expert order, so the identity index is a copy.
+    if inputs_are_pre_routed and topk_scores.is_contiguous() and topk_scores.dim() == 1:
+        s = topk_scores
+    else:
+        s = topk_scores[s_scatter_idx]
+    if inputs_are_pre_routed and dout.is_contiguous():
+        dout_gathered = dout
+    else:
+        dout_gathered = dout[x_gather_idx]
     dh_unscaled = torch.empty(TK, I, dtype=dh.dtype, device=dh.device)
     fuse_swiglu_bwd = (
         os.environ.get("LUMEN_EXPERT_FUSED_SWIGLU", "0") == "1"
