@@ -105,7 +105,8 @@ def test_pre_routed_fused_swiglu_matches_separate_kernel(monkeypatch):
         tokens, hidden, dtype=torch.bfloat16, device=device, requires_grad=True
     )
     x_fused = x_ref.detach().clone().requires_grad_(True)
-    scores = torch.ones(tokens, dtype=torch.float32, device=device)
+    scores_ref = torch.rand(tokens, dtype=torch.float32, device=device, requires_grad=True)
+    scores_fused = scores_ref.detach().clone().requires_grad_(True)
     w1_ref = torch.randn(
         experts,
         hidden,
@@ -125,7 +126,7 @@ def test_pre_routed_fused_swiglu_matches_separate_kernel(monkeypatch):
     w1_fused = w1_ref.detach().clone().requires_grad_(True)
     w2_fused = w2_ref.detach().clone().requires_grad_(True)
 
-    def run(x, w1, w2, enabled):
+    def run(x, w1, w2, scores, enabled):
         monkeypatch.setenv("LUMEN_EXPERT_FUSED_SWIGLU", enabled)
         return moe_pre_routed_inputs(
             x,
@@ -139,13 +140,16 @@ def test_pre_routed_fused_swiglu_matches_separate_kernel(monkeypatch):
             SonicMoEActivationType.SWIGLU,
         )[0]
 
-    output_ref = run(x_ref, w1_ref, w2_ref, "0")
-    output_fused = run(x_fused, w1_fused, w2_fused, "1")
+    output_ref = run(x_ref, w1_ref, w2_ref, scores_ref, "0")
+    output_fused = run(x_fused, w1_fused, w2_fused, scores_fused, "1")
     torch.testing.assert_close(output_fused, output_ref, rtol=0, atol=0)
 
     grad = torch.randn_like(output_ref)
+    monkeypatch.setenv("LUMEN_EXPERT_FUSED_SWIGLU", "0")
     output_ref.backward(grad)
+    monkeypatch.setenv("LUMEN_EXPERT_FUSED_SWIGLU", "1")
     output_fused.backward(grad)
     torch.testing.assert_close(x_fused.grad, x_ref.grad, rtol=0, atol=0)
     torch.testing.assert_close(w1_fused.grad, w1_ref.grad, rtol=0, atol=0)
     torch.testing.assert_close(w2_fused.grad, w2_ref.grad, rtol=0, atol=0)
+    torch.testing.assert_close(scores_fused.grad, scores_ref.grad, rtol=0, atol=0)

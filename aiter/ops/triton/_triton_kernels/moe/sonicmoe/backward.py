@@ -1,10 +1,12 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from .activation_kernels import activation_bwd, activation_fwd
 from .enums import LIBRARY_NAME
-from .grouped_gemm_triton import grouped_gemm
+from .grouped_gemm_triton import grouped_gemm, grouped_gemm_swiglu_bwd
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 
 
@@ -253,21 +255,46 @@ def _down_projection_backward_act(
     # dot(dout, a @ w2) == dot(a, dout @ w2.T), while da = score * u.
     dout_gathered = dout[x_gather_idx]
     dh_unscaled = torch.empty(TK, I, dtype=dh.dtype, device=dh.device)
-    grouped_gemm(
-        dout_gathered,
-        gemm_w2,
-        expert_frequency_offset,
-        out=dh_unscaled,
-        B_is_transposed=grouped_weight_layout,
+    fuse_swiglu_bwd = (
+        os.environ.get("LUMEN_EXPERT_FUSED_SWIGLU", "0") == "1"
+        and os.environ.get("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton") == "triton"
+        and grouped_weight_layout
+        and activation_type == "swiglu"
+        and not concat_layout
+        and b2 is None
+        and dout.dtype == torch.bfloat16
+        and h.is_contiguous()
+        and dh.is_contiguous()
+        and a_prime.is_contiguous()
     )
+    if fuse_swiglu_bwd:
+        grouped_gemm_swiglu_bwd(
+            dout_gathered,
+            gemm_w2,
+            expert_frequency_offset,
+            h,
+            s,
+            dh_unscaled,
+            a_prime,
+            dh,
+        )
+        ds_scattered = (a_prime.float() * dh_unscaled.float()).sum(dim=-1)
+    else:
+        grouped_gemm(
+            dout_gathered,
+            gemm_w2,
+            expert_frequency_offset,
+            out=dh_unscaled,
+            B_is_transposed=grouped_weight_layout,
+        )
 
-    a_prime_val = activation_fwd(h, I, activation_type, concat_layout)
-    a_prime.copy_(a_prime_val)
-    ds_scattered = (a_prime_val.float() * dh_unscaled.float()).sum(dim=-1)
+        a_prime_val = activation_fwd(h, I, activation_type, concat_layout)
+        a_prime.copy_(a_prime_val)
+        ds_scattered = (a_prime_val.float() * dh_unscaled.float()).sum(dim=-1)
 
-    dh_raw = dh_unscaled * s.unsqueeze(-1)
-    dh_act = activation_bwd(h, dh_raw, I, activation_type, concat_layout)
-    dh.copy_(dh_act)
+        dh_raw = dh_unscaled * s.unsqueeze(-1)
+        dh_act = activation_bwd(h, dh_raw, I, activation_type, concat_layout)
+        dh.copy_(dh_act)
 
     if db2 is None:
         ds[s_scatter_idx] = ds_scattered
