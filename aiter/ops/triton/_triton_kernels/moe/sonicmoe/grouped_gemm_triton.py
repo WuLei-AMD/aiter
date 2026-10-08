@@ -137,18 +137,20 @@ _QWEN3_DW_CONFIGS = {
         "num_stages": 2,
     },
     # Pre-routed Sonic expert w1 wgrad has no gather index.
+    # gfx950 OCP FP8: a 128-wide token tile matches the scale block and
+    # keeps the K accumulator in a shape the MFMA path can hold.
     (1536, 2048, 16, False): {
         "BLOCK_K": 128,
-        "BLOCK_N": 128,
-        "BLOCK_T": 64,
-        "num_warps": 4,
+        "BLOCK_N": 64,
+        "BLOCK_T": 128,
+        "num_warps": 8,
         "num_stages": 2,
     },
     (2048, 768, 16, False): {
         "BLOCK_K": 128,
         "BLOCK_N": 128,
-        "BLOCK_T": 32,
-        "num_warps": 4,
+        "BLOCK_T": 128,
+        "num_warps": 8,
         "num_stages": 2,
     },
 }
