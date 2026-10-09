@@ -825,6 +825,7 @@ def _grouped_gemm_dw_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_GATHER_IDX: tl.constexpr,
+    ACCUMULATE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_k_blocks: tl.constexpr = tl.cdiv(K, BLOCK_K)
@@ -905,7 +906,6 @@ def _grouped_gemm_dw_kernel(
             dot *= a_scale[:, None] * b_scale[None, :]
         acc += dot
 
-    c = acc.to(C_ptr.dtype.element_ty)
     expert_id_i64 = expert_id.to(tl.int64)
     c_ptrs = (
         C_ptr
@@ -914,7 +914,14 @@ def _grouped_gemm_dw_kernel(
         + offs_n[None, :].to(tl.int64) * stride_cn
     )
     c_mask = k_mask[:, None] & n_mask[None, :]
-    tl.store(c_ptrs, c, mask=c_mask)
+    if ACCUMULATE:
+        # Same rounding as storing bf16 and letting aten add_ cast it back to fp32.
+        c = acc.to(tl.bfloat16).to(tl.float32)
+        prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
+        tl.store(c_ptrs, prev + c, mask=c_mask)
+    else:
+        c = acc.to(C_ptr.dtype.element_ty)
+        tl.store(c_ptrs, c, mask=c_mask)
 
 
 _grouped_gemm_dw_kernel_autotuned = triton.autotune(
@@ -946,6 +953,7 @@ def grouped_gemm(
     B_scale: torch.Tensor | None = None,
     block_size: int = 128,
     out_dtype: torch.dtype | None = None,
+    accumulate: bool = False,
 ):
     """Grouped GEMM. Optional ``A_scale``/``B_scale`` enable blockwise FP8.
 
@@ -998,6 +1006,7 @@ def grouped_gemm(
             triton_b_scale,
             block_size,
             out_dtype,
+            accumulate,
         )
         return out if out is not None else result
     if backend == "multistream":
@@ -1227,11 +1236,23 @@ def _grouped_gemm_triton(
     B_scale: torch.Tensor | None = None,
     block_size: int = 128,
     out_dtype: torch.dtype | None = None,
+    accumulate: bool = False,
 ):
     if A_is_transposed and B.dim() == 2:
         return _grouped_gemm_dw(
-            A, B, cu_seqlens, out, A_idx, A_scale, B_scale, block_size, out_dtype
+            A,
+            B,
+            cu_seqlens,
+            out,
+            A_idx,
+            A_scale,
+            B_scale,
+            block_size,
+            out_dtype,
+            accumulate,
         )
+    if accumulate:
+        raise ValueError("accumulate is only supported for grouped wgrad")
 
     E = B.shape[0]
     K_dim = B.shape[1]
@@ -1329,12 +1350,20 @@ def _grouped_gemm_dw(
     B_scale: torch.Tensor | None = None,
     block_size: int = 128,
     out_dtype: torch.dtype | None = None,
+    accumulate: bool = False,
 ):
     K_dim = A.shape[1]
     N = B.shape[1]
     E = cu_seqlens.shape[0] - 1
 
-    if out is None:
+    if accumulate:
+        if out is None or out.dtype != torch.float32:
+            raise ValueError("grouped wgrad accumulate requires an fp32 out buffer")
+        if tuple(out.shape) != (E, K_dim, N):
+            raise ValueError(
+                f"accumulate out shape {tuple(out.shape)} != {(E, K_dim, N)}"
+            )
+    elif out is None:
         out = torch.empty(
             E,
             K_dim,
@@ -1393,6 +1422,7 @@ def _grouped_gemm_dw(
         "SCALE_BLOCK_SIZE": block_size,
         "BLOCKWISE_FP8": blockwise_fp8,
         "HAS_GATHER_IDX": A_idx is not None,
+        "ACCUMULATE": accumulate,
     }
     fixed = _QWEN3_DW_CONFIGS.get((N, K_dim, E, A_idx is not None))
     dw_cfg = get_grouped_gemm_dw_config(N, K_dim, E)
