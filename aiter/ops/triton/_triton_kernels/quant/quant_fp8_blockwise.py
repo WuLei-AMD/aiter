@@ -127,6 +127,75 @@ def quant_fp8_blockwise_segment_m_kernel(
     )
 
 
+# One BF16 read of a grad, two FP8 results:
+#   row 1×BLOCK along N (dgrad) and per-expert BLOCK×1 along M (wgrad).
+# Col tiles restart at each expert so a scale never crosses an expert boundary.
+@triton.jit
+def quant_fp8_blockwise_row_and_segment_kernel(
+    x_ptr,
+    row_fp8_ptr,
+    row_scale_ptr,
+    col_fp8_ptr,
+    col_scale_ptr,
+    N,
+    batch_size,
+    seg_indptr,
+    scales_seg_indptr_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    total_m_block = tl.load(scales_seg_indptr_ptr + batch_size)
+    if pid_m >= total_m_block:
+        return
+
+    m_range_start, m_range_end, _bid = compute_m_range(
+        pid_m, batch_size, seg_indptr, scales_seg_indptr_ptr, BLOCK_SIZE
+    )
+    if m_range_end - m_range_start == 0:
+        return
+
+    offs_m = m_range_start + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    row_ok = offs_m < m_range_end
+    col_ok = offs_n < N
+    mask = row_ok[:, None] & col_ok[None, :]
+
+    x_tile = tl.load(
+        x_ptr + offs_m[:, None] * N + offs_n[None, :], mask=mask, other=0.0
+    ).to(tl.float32)
+    x_abs = tl.abs(x_tile)
+
+    row_amax = tl.maximum(tl.max(x_abs, axis=1, keep_dims=True), 1e-4)
+    row_qscale = FP8_MAX / row_amax
+    row_fp8 = tl.clamp(x_tile * row_qscale, min=-FP8_MAX, max=FP8_MAX)
+    tl.store(
+        row_fp8_ptr + offs_m[:, None] * N + offs_n[None, :],
+        row_fp8.to(row_fp8_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    tl.store(
+        row_scale_ptr + offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n,
+        tl.reshape(1.0 / row_qscale, BLOCK_SIZE),
+        mask=row_ok,
+    )
+
+    col_amax = tl.maximum(tl.max(x_abs, axis=0, keep_dims=True), 1e-4)
+    col_qscale = FP8_MAX / col_amax
+    col_fp8 = tl.clamp(x_tile * col_qscale, min=-FP8_MAX, max=FP8_MAX)
+    tl.store(
+        col_fp8_ptr + offs_m[:, None] * N + offs_n[None, :],
+        col_fp8.to(col_fp8_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    tl.store(
+        col_scale_ptr + pid_m * N + offs_n,
+        tl.reshape(1.0 / col_qscale, BLOCK_SIZE),
+        mask=col_ok,
+    )
+
+
 # w_ptr         [B, M, N]
 # w_fp8_ptr     [B, M, N] FP8
 # w_scales_ptr  [B, M // BLOCK_SIZE, N // BLOCK_SIZE] FP32
