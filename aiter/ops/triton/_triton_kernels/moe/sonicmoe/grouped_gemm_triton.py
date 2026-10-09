@@ -97,32 +97,34 @@ _QWEN3_FWD_CONFIGS = {
         "num_warps": 4,
         "num_stages": 2,
     },
-    # Pre-routed Sonic expert w1 forward has no gather index.
+    # Pre-routed Sonic expert forward and dgrad have no gather index.
+    # gfx950 OCP FP8: BLOCK_K matches the 128-wide scale block. Eight warps
+    # were slower on these shapes.
     (1536, 2048, 16, False): {
         "BLOCK_M": 128,
         "BLOCK_N": 128,
-        "BLOCK_K": 64,
+        "BLOCK_K": 128,
         "num_warps": 4,
         "num_stages": 2,
     },
     (2048, 768, 16, False): {
         "BLOCK_M": 128,
         "BLOCK_N": 128,
-        "BLOCK_K": 64,
+        "BLOCK_K": 128,
         "num_warps": 4,
         "num_stages": 2,
     },
     (768, 2048, 16, False): {
         "BLOCK_M": 128,
         "BLOCK_N": 128,
-        "BLOCK_K": 64,
+        "BLOCK_K": 128,
         "num_warps": 4,
         "num_stages": 2,
     },
     (2048, 1536, 16, False): {
         "BLOCK_M": 128,
         "BLOCK_N": 128,
-        "BLOCK_K": 64,
+        "BLOCK_K": 128,
         "num_warps": 4,
         "num_stages": 2,
     },
